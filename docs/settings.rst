@@ -185,6 +185,38 @@ The import string of the class (model) representing your refresh token admin cla
 Overwrite this value if you wrote your own implementation (subclass of
 ``oauth2_provider.authorization_server.admin.RefreshTokenAdmin``).
 
+ACCOUNT_DELETION_REVOCATION_RETENTION_SECONDS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``604800`` (7 days)
+
+How long the credential-revocation evidence written by an account erasure is kept.
+Each erasure records a SHA-256 digest of every credential it revokes -- authorization
+code, device grant, access token, refresh token and ID token -- and the client it was
+issued to. It never records the credential value or any personal data.
+
+The evidence is what refuses a credential that survived an interrupted erasure, for
+example an access token left behind with ``user = NULL`` by a swapped token model
+whose user foreign key is ``SET_NULL``. Without it, such a row would be
+indistinguishable from a client-credentials token: introspection would omit
+``username`` and the resource server would receive ``user = None``. Set this
+comfortably above ``ACCESS_TOKEN_EXPIRE_SECONDS``; credentials whose rows the erasure
+deleted cannot be presented at all, so the evidence only has to outlive a stranded
+row. ``cleartokens`` purges it once the window has passed.
+
+ACCOUNT_DELETION_GUARD_USER_DELETE
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``True``
+
+Connect ``pre_delete``/``post_delete`` receivers to ``AUTH_USER_MODEL``, so that a
+plain ``user.delete()`` written elsewhere in the project snapshots the account's
+credentials into the revocation ledger before Django's collector runs, and removes
+any credential row the collector stranded (a nullable ``user`` FK it cleared rather
+than cascaded). A credential-less account creates no journal row.
+
+Turn this off only if every erasure in the deployment goes through
+:func:`oauth2_provider.authorization_server.account_deletion.delete_account`; see
+:ref:`account-deletion`.
+
 CLEAR_EXPIRED_TOKENS_BATCH_SIZE
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default: ``10000``

@@ -37,6 +37,13 @@ from .authorization_server.oidc.server import signs_userinfo_for
 from .authorization_server.response_modes import response_mode_permitted
 from .core.bcp import bcp_compliant
 from .core.exceptions import FatalClientError
+from .core.rfc7523 import JWT_BEARER_CLIENT_ASSERTION_TYPE
+from .core.revocation import (
+    is_authorization_code_revoked,
+    is_device_grant_revoked,
+    is_id_token_revoked,
+    is_refresh_token_revoked,
+)
 from .core.scopes import get_scopes_backend
 from .core.utils import jwk_from_pem
 from .models import (
@@ -46,6 +53,7 @@ from .models import (
     AbstractRefreshToken,
     get_access_token_model,
     get_application_model,
+    get_device_grant_model,
     get_grant_model,
     get_id_token_model,
     get_refresh_token_model,
@@ -503,9 +511,13 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         return user
 
     def validate_code(self, client_id, code, client, request, *args, **kwargs):
+        if is_authorization_code_revoked(code):
+            # Account erasure revoked this code; its row may have survived a
+            # nullable user FK.  Never exchange it for a token.
+            return False
         try:
             grant = Grant.objects.get(code=code, application=client)
-            if not grant.is_expired():
+            if not grant.is_expired() and grant.user_id is not None:
                 request.scopes = grant.scope.split(" ")
                 request.user = grant.user
                 if grant.nonce:
@@ -1099,6 +1111,35 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
                 return []
         return rt.access_token.scope
 
+    def validate_device_code(self, client_id, code, request, *args, **kwargs):
+        """Return the RFC 8628 §3.5 status of a device_code (oauthlib 4 hook).
+
+        An erasure revokes the device grant by credential identity, so a row
+        stranded by a nullable user FK cannot authorize a token.  A granted
+        row whose user was cleared is refused the same way ``validate_code``
+        refuses an orphaned grant.
+        """
+        if is_device_grant_revoked(code):
+            return None
+        device_grant_model = get_device_grant_model()
+        try:
+            device = device_grant_model.objects.get(device_code=code)
+        except device_grant_model.DoesNotExist:
+            return None
+        if device.client_id != client_id:
+            return None
+        if device.is_expired():
+            return "expired_token"
+        if device.status == device.DENIED:
+            return "access_denied"
+        if device.status == device.AUTHORIZATION_PENDING:
+            return "authorization_pending"
+        if device.status != device.AUTHORIZED or device.user_id is None:
+            return None
+        request.user = device.user
+        request.scopes = device.scope.split() if device.scope else []
+        return "authorized"
+
     def validate_refresh_token(self, refresh_token, client, request, *args, **kwargs):
         """
         Check refresh_token exists and refers to the right client.
@@ -1107,8 +1148,19 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
 
         token_checksum = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
         rt = RefreshToken.objects.filter(token_checksum=token_checksum).select_related("access_token").first()
+        if rt is not None and is_refresh_token_revoked(token_checksum, rt.token_family):
+            # An erasure revoked this refresh token (or its family); a stranded
+            # row must not mint a fresh access token.
+            return False
 
         if not rt:
+            return False
+
+        if rt.user_id is None:
+            # ``RefreshToken.user`` is CASCADE, so this is a row stranded by a
+            # swapped model or a collector that did not cascade.  It has no
+            # resource owner to bind the new token to; refuse rather than issue
+            # a user-less token (the client-credentials shape).
             return False
 
         if rt.revoked is not None:
@@ -1478,7 +1530,14 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             claims = json.loads(jwt_token.claims)
             # Every ID Token this OP issues has a jti. A verified JWT without one is
             # another JWT signed with the OP key, such as a signed UserInfo response.
-            return IDToken.objects.get(jti=claims["jti"])
+            if is_id_token_revoked(claims.get("jti")):
+                return None
+            stored = IDToken.objects.get(jti=claims["jti"])
+            if stored.user_id is None:
+                # A stranded ID token from an erased user must not be presented
+                # as a live identity assertion.
+                return None
+            return stored
         except (JWException, JWTExpired, KeyError, IDToken.DoesNotExist):
             return None
 

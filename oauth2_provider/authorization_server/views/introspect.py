@@ -14,6 +14,10 @@ from oauthlib.common import Request as OauthlibRequest
 
 from oauth2_provider.core.backends_oauthlib import _AUTHENTICATED_CLIENT_ATTRIBUTE
 from oauth2_provider.core.compat import login_not_required
+from oauth2_provider.core.revocation import (
+    is_access_token_revoked,
+    is_userless_token_an_impersonation,
+)
 from oauth2_provider.core.views import FormEncodedRequestMixin
 from oauth2_provider.models import AbstractApplication, get_access_token_model
 from oauth2_provider.resource_server.views.generic import ClientProtectedScopedResourceView
@@ -200,6 +204,11 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
             )
         try:
             token_checksum = hashlib.sha256(token_value.encode("utf-8")).hexdigest()
+            if is_access_token_revoked(token_checksum):
+                # An erasure revoked this credential; its row may have survived
+                # (e.g. a nullable ``user`` FK cleared by the collector).  Report
+                # inactive, never a user-less "active" token.
+                return JsonResponse({"active": False}, status=200)
             token = (
                 get_access_token_model()
                 .objects.select_related("user", "application")
@@ -208,25 +217,34 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
         except ObjectDoesNotExist:
             return JsonResponse({"active": False}, status=200)
         else:
-            if token.is_valid():
-                data = {
-                    "active": True,
-                    "scope": token.scope,
-                    "exp": int(calendar.timegm(token.expires.timetuple())),
-                }
-                if token.application:
-                    data["client_id"] = token.application.client_id
-                if token.user:
-                    data["username"] = token.user.get_username()
-
-                # RFC 8707: Include audience list if token has resource binding
-                audiences = token.resource
-                if audiences:
-                    data["aud"] = audiences
-
-                return JsonResponse(data)
-            else:
+            if not token.is_valid():
                 return JsonResponse({"active": False}, status=200)
+            if token.user is None and is_userless_token_an_impersonation(token.application):
+                # A client that cannot use client_credentials never legitimately
+                # holds an ownerless token.  This is a stranded user token (an
+                # interrupted erasure) or a forgery: report inactive, so the
+                # response carries neither a username nor a client identity.
+                return JsonResponse({"active": False}, status=200)
+            data = {
+                "active": True,
+                "scope": token.scope,
+                "exp": int(calendar.timegm(token.expires.timetuple())),
+            }
+            if token.application:
+                data["client_id"] = token.application.client_id
+            # Only a real ``username`` is returned.  A client-credentials token
+            # has no resource owner and legitimately omits the member; a token
+            # whose owner was erased is refused above by its ledger entry, so
+            # its missing user never reads as a client identity.
+            if token.user is not None:
+                data["username"] = token.user.get_username()
+
+            # RFC 8707: Include audience list if token has resource binding
+            audiences = token.resource
+            if audiences:
+                data["aud"] = audiences
+
+            return JsonResponse(data)
 
     def get(self, request, *args, **kwargs):
         """

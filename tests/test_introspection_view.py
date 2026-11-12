@@ -149,10 +149,15 @@ class TestTokenIntrospectionViews(TestCase):
             },
         )
 
-    def test_view_get_valid_token_without_user(self):
-        """
-        Test that when you pass a valid token as URL parameter,
-        a json with an active token state is provided
+    def test_view_reports_inactive_for_userless_token_of_a_user_only_client(self):
+        """A userless token from a client that cannot use client_credentials is refused.
+
+        ``user = NULL`` is the shape of a client-credentials token, but this
+        application is registered for the authorization-code grant only, so it
+        never legitimately obtains one.  The row is a stranded user token (an
+        erased owner) or a hand-made forgery; reporting it active would present
+        it as a client identity.  An erasure records the credential in the
+        revocation ledger and this check catches the stranded row either way.
         """
         auth_headers = {
             "HTTP_AUTHORIZATION": "Bearer " + self.resource_server_token.token,
@@ -162,17 +167,36 @@ class TestTokenIntrospectionViews(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        content = response.json()
-        self.assertIsInstance(content, dict)
-        self.assertDictEqual(
-            content,
-            {
-                "active": True,
-                "scope": self.token_without_user.scope,
-                "client_id": self.token_without_user.application.client_id,
-                "exp": int(calendar.timegm(self.token_without_user.expires.timetuple())),
-            },
+        self.assertDictEqual(response.json(), {"active": False})
+
+    def test_view_keeps_client_credentials_token_active_without_username(self):
+        """A genuine client-credentials token has no owner and stays active."""
+        credentials_app = Application.objects.create(
+            name="Client credentials app",
+            redirect_uris="http://example.org",
+            client_type=Application.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=Application.GRANT_CLIENT_CREDENTIALS,
+            client_secret=CLEARTEXT_SECRET,
         )
+        token = AccessToken.objects.create(
+            user=None,
+            token="client-credentials-token",
+            application=credentials_app,
+            expires=timezone.now() + datetime.timedelta(days=1),
+            scope="read write dolphin",
+        )
+        auth_headers = {
+            "HTTP_AUTHORIZATION": "Bearer " + self.resource_server_token.token,
+        }
+        response = self.client.get(
+            reverse("oauth2_provider:introspect"), {"token": token.token}, **auth_headers
+        )
+
+        self.assertEqual(response.status_code, 200)
+        content = response.json()
+        self.assertIs(content["active"], True)
+        self.assertEqual(content["client_id"], credentials_app.client_id)
+        self.assertNotIn("username", content)
 
     def test_view_get_valid_token_without_app(self):
         """

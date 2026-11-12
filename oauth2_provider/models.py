@@ -1561,6 +1561,158 @@ class DeviceGrant(AbstractDeviceGrant):
         swappable = "OAUTH2_PROVIDER_DEVICE_GRANT_MODEL"
 
 
+class AccountDeletion(models.Model):
+    """A resumable, idempotent record of one account's credential revocation.
+
+    Deleting a user account has two obligations that pull in opposite
+    directions: the personal data must go, and any credential that is still
+    live must stop working *before* the account row, and with it the
+    credential's foreign key, disappears.  Doing both in one transaction is
+    not enough: a crash between the two leaves credentials that either survived
+    the account (a token row whose ``user`` was cleared, which introspection
+    would then present as a client token) or were never revoked at all.
+
+    This row is the checkpoint between those two halves.  It deliberately
+    stores no personal data -- only the user's primary key as a string, so it
+    works for integer and UUID custom user models alike, plus the model label
+    for an operator's audit.  The credentials themselves are recorded in
+    :class:`CredentialRevocation` before any row is deleted, which is what lets
+    :func:`~oauth2_provider.authorization_server.account_deletion.resume_account_deletion`
+    finish the job after the user row is gone.
+
+    Fields:
+
+    * :attr:`user_pk` The erased account's primary key, as text.
+    * :attr:`state` Which checkpoint the job reached.
+    * :attr:`delete_account` Whether the user row itself is to be erased, or
+      only its credentials (the "revoke now, erase later" integration).
+    * :attr:`requested_at` When the job was created.
+    * :attr:`snapshot_at` When every credential was recorded in the ledger.
+    * :attr:`credentials_revoked_at` When the last credential row was removed.
+    * :attr:`account_erased_at` When the user row was deleted.
+    * :attr:`completed_at` When the job finished.
+    * :attr:`revocation_purge_after` When the ledger entries may be purged.
+    """
+
+    STATE_REQUESTED = "requested"
+    STATE_SNAPSHOTTED = "snapshotted"
+    STATE_CREDENTIALS_REVOKED = "credentials-revoked"
+    STATE_ACCOUNT_ERASED = "account-erased"
+    STATE_COMPLETED = "completed"
+    STATES = (
+        (STATE_REQUESTED, _("Requested")),
+        (STATE_SNAPSHOTTED, _("Credentials recorded")),
+        (STATE_CREDENTIALS_REVOKED, _("Credentials revoked")),
+        (STATE_ACCOUNT_ERASED, _("Account erased")),
+        (STATE_COMPLETED, _("Completed")),
+    )
+
+    id = models.BigAutoField(primary_key=True)
+    user_pk = models.CharField(max_length=255, db_index=True, verbose_name=_("user primary key"))
+    account_model = models.CharField(
+        max_length=255, blank=True, default="", verbose_name=_("account model")
+    )
+    state = models.CharField(max_length=32, choices=STATES, default=STATE_REQUESTED, verbose_name=_("state"))
+    delete_account = models.BooleanField(default=True, verbose_name=_("delete account"))
+    requested_at = models.DateTimeField(auto_now_add=True, verbose_name=_("requested"))
+    snapshot_at = models.DateTimeField(null=True, blank=True, verbose_name=_("credentials recorded"))
+    credentials_revoked_at = models.DateTimeField(
+        null=True, blank=True, verbose_name=_("credentials revoked")
+    )
+    account_erased_at = models.DateTimeField(null=True, blank=True, verbose_name=_("account erased"))
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name=_("completed"))
+    revocation_purge_after = models.DateTimeField(
+        null=True, blank=True, verbose_name=_("purge evidence after")
+    )
+    summary = models.JSONField(default=dict, blank=True, verbose_name=_("summary"))
+
+    def is_finished(self) -> bool:
+        return self.state == self.STATE_COMPLETED
+
+    def __str__(self) -> str:
+        return "AccountDeletion #{self.pk} ({self.state})".format(self=self)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user_pk", "state"]),
+            models.Index(fields=["revocation_purge_after"]),
+        ]
+
+
+class CredentialRevocation(models.Model):
+    """One credential recorded as revoked by an :class:`AccountDeletion` job.
+
+    A row is written for every authorization code, device grant, access token,
+    refresh token and ID token owned by the account *before* the credential is
+    deleted.  It is bounded-lifetime evidence, not a second copy of the
+    credential: the raw value is never stored, only a SHA-256 digest (for an
+    access or refresh token this is the same digest the token model keeps in
+    ``token_checksum``), the client identifier, and the row's primary key so a
+    resumed job can find the row even after its user foreign key is gone.
+
+    While the row lives,
+    :func:`~oauth2_provider.core.revocation.is_access_token_revoked` refuses the
+    credential even if some other code path recreated or stranded a token row.
+    That is the safety net for the case a deletion is interrupted after the
+    user association was cleared: a token row left with ``user = NULL`` must
+    never be accepted as a client-credentials token.  Once ``purge_after`` has
+    passed the evidence is deleted; by then the credential rows themselves are
+    long gone, so a presented credential still fails lookup.
+
+    Fields:
+
+    * :attr:`deletion` The job that revoked this credential.
+    * :attr:`credential_kind` ``authorization_code``, ``device_grant``,
+      ``access_token``, ``refresh_token`` or ``id_token``.
+    * :attr:`credential_hash` SHA-256 of the credential value.
+    * :attr:`object_pk` The credential row's primary key, as text.
+    * :attr:`client_id` The client the credential was issued to (not a secret).
+    * :attr:`token_family` The refresh family, for refresh tokens.
+    * :attr:`revoked_at` When the evidence was recorded.
+    * :attr:`purge_after` The end of the evidence retention window.
+    """
+
+    KIND_AUTHORIZATION_CODE = "authorization_code"
+    KIND_DEVICE_GRANT = "device_grant"
+    KIND_ACCESS_TOKEN = "access_token"
+    KIND_REFRESH_TOKEN = "refresh_token"
+    KIND_ID_TOKEN = "id_token"
+    KINDS = (
+        (KIND_AUTHORIZATION_CODE, _("Authorization code")),
+        (KIND_DEVICE_GRANT, _("Device authorization grant")),
+        (KIND_ACCESS_TOKEN, _("Access token")),
+        (KIND_REFRESH_TOKEN, _("Refresh token")),
+        (KIND_ID_TOKEN, _("ID token")),
+    )
+
+    id = models.BigAutoField(primary_key=True)
+    deletion = models.ForeignKey(AccountDeletion, on_delete=models.CASCADE, related_name="revocations")
+    credential_kind = models.CharField(max_length=32, choices=KINDS, verbose_name=_("credential kind"))
+    credential_hash = models.CharField(max_length=64, db_index=True, verbose_name=_("credential hash"))
+    object_pk = models.CharField(
+        max_length=64, blank=True, default="", db_index=True, verbose_name=_("row primary key")
+    )
+    client_id = models.CharField(max_length=255, blank=True, default="", verbose_name=_("client ID"))
+    token_family = models.UUIDField(null=True, blank=True, verbose_name=_("token family"))
+    revoked_at = models.DateTimeField(default=timezone.now, verbose_name=_("revoked"))
+    purge_after = models.DateTimeField(db_index=True, verbose_name=_("purge after"))
+
+    def __str__(self) -> str:
+        return "{self.credential_kind} revocation by deletion #{self.deletion_id}".format(self=self)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["deletion", "credential_kind", "credential_hash"],
+                name="%(app_label)s_%(class)s_unique_deletion_credential",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["credential_kind", "credential_hash", "purge_after"]),
+            models.Index(fields=["purge_after"]),
+        ]
+
+
 @dataclass
 class DeviceRequest:
     # https://datatracker.ietf.org/doc/html/rfc8628#section-3.1

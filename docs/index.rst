@@ -68,6 +68,7 @@ Index
    advanced_topics
    security
    security_process
+   account_deletion
 
 .. toctree::
    :maxdepth: 2

@@ -101,6 +101,18 @@ DEFAULTS = {
     # Expired-token cleanup (manage.py cleartokens)
     "CLEAR_EXPIRED_TOKENS_BATCH_SIZE": 10000,
     "CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL": 0,
+    # Account-erasure revocation evidence. A deletion records a SHA-256 of every
+    # credential it revokes (never the credential itself) and keeps that evidence
+    # for this long, so a credential stranded by an interrupted deletion -- e.g. a
+    # swapped token model whose user FK is SET_NULL rather than CASCADE -- is still
+    # refused. Must comfortably exceed ACCESS_TOKEN_EXPIRE_SECONDS; refresh tokens
+    # are deleted, not left to rely on the evidence.
+    "ACCOUNT_DELETION_REVOCATION_RETENTION_SECONDS": 7 * 24 * 60 * 60,
+    # Connect pre_delete/post_delete receivers to AUTH_USER_MODEL so a direct
+    # ``user.delete()`` snapshots its credentials before the collector runs and
+    # removes any credential the collector stranded (SET_NULL). Turn this off only
+    # if the deployment erases accounts exclusively through delete_account().
+    "ACCOUNT_DELETION_GUARD_USER_DELETE": True,
     # =====================================================================
     # Authorization Server (provider side)
     # =====================================================================

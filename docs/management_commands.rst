@@ -36,6 +36,11 @@ To prevent the CPU and RAM high peaks during deletion process use ``CLEAR_EXPIRE
 
 The ``cleartokens`` management command will also delete expired access and ID tokens alongside expired refresh tokens.
 
+``cleartokens`` also purges account-erasure revocation evidence whose
+``ACCOUNT_DELETION_REVOCATION_RETENTION_SECONDS`` window has passed.  See
+:ref:`account-deletion` for what that evidence is and why it outlives the
+deleted credential rows.
+
 Refresh tokens that have already been revoked (for example by refresh token rotation) are removed as
 soon as their ``REFRESH_TOKEN_GRACE_PERIOD_SECONDS`` grace period has passed, without waiting for
 ``REFRESH_TOKEN_EXPIRE_SECONDS``. The exception is when ``REFRESH_TOKEN_REUSE_PROTECTION`` is enabled:

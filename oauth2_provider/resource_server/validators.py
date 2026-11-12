@@ -35,6 +35,10 @@ from jwcrypto.common import JWException
 # client package.
 from oauth2_provider.client.client_assertions import make_client_assertion
 from oauth2_provider.core.rfc7523 import JWT_BEARER_CLIENT_ASSERTION_TYPE
+from oauth2_provider.core.revocation import (
+    is_access_token_revoked,
+    is_userless_token_an_impersonation,
+)
 from oauth2_provider.core.utils import get_timezone
 from oauth2_provider.models import get_access_token_model
 from oauth2_provider.settings import oauth2_settings
@@ -336,6 +340,14 @@ class ResourceServerValidatorMixin:
 
         access_token = self._load_access_token(token)
 
+        # An erasure revoked this credential.  Its row may still exist (a
+        # nullable user FK cleared by a collector, or a swapped model that did
+        # not cascade), and accepting it would hand the resource server a
+        # user-less token -- the shape of client_credentials.  Refuse it before
+        # any ``is_valid`` check can match.
+        if access_token is not None and is_access_token_revoked(access_token.token_checksum):
+            access_token = None
+
         # if there is no token or it's invalid then introspect the token if there's an external OAuth server
         if not access_token or not access_token.is_valid(scopes):
             # A fresh assertion (fresh jti, short exp) is built per introspection call;
@@ -372,6 +384,18 @@ class ResourceServerValidatorMixin:
                         ]
                     )
                     return False
+
+            if access_token.user is None and is_userless_token_an_impersonation(access_token.application):
+                # An ownerless token from a client that cannot use
+                # client_credentials is a stranded user token; refuse it rather
+                # than hand ``request.user = None`` to the resource server.
+                request.oauth2_error = OrderedDict(
+                    [
+                        ("error", "invalid_token"),
+                        ("error_description", _("The access token is invalid.")),
+                    ]
+                )
+                return False
 
             # Reject tokens whose application is no longer usable, mirroring the
             # is_usable() check the issuance path performs in _load_application.

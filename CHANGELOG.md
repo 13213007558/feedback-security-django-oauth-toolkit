@@ -15,6 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Account erasure that revokes credentials by identity instead of by the user FK.
+  `oauth2_provider.authorization_server.account_deletion.delete_account()` records
+  authorization codes, device grants, access tokens, refresh tokens (including their
+  `token_family`) and ID tokens in the new `CredentialRevocation` ledger, deletes them,
+  and then erases the account, in committed checkpoints tracked by the new
+  `AccountDeletion` model (migration `0033`). `resume_account_deletion()` continues an
+  interrupted job after the account row is gone, and `delete_account_row=False` supports
+  "revoke now, erase later" retention policies. A plain `user.delete()` is covered too:
+  `ACCOUNT_DELETION_GUARD_USER_DELETE` (on by default) connects `pre_delete`/`post_delete`
+  receivers to `AUTH_USER_MODEL`. The ledger stores only SHA-256 digests and the client
+  identifier, bounded by `ACCOUNT_DELETION_REVOCATION_RETENTION_SECONDS` and purged by
+  `cleartokens`. Introspection now answers `active: false` for an evidenced token and
+  for an ownerless token issued to a client that cannot use `client_credentials`;
+  bearer validation refuses both instead of handing `request.user = None` to the
+  resource server, and refresh validation refuses an evidenced digest or family and a
+  row with no user. See the new "Account Erasure" documentation page.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

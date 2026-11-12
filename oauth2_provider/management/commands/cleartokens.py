@@ -1,5 +1,6 @@
 from django.core.management.base import BaseCommand
 
+from ...core.revocation import purge_revocation_evidence
 from ...models import clear_expired, refresh_token_expire_timedelta
 
 
@@ -18,3 +19,7 @@ class Command(BaseCommand):
                 )
             )
         clear_expired()
+        # Account-erasure evidence is bounded by
+        # ACCOUNT_DELETION_REVOCATION_RETENTION_SECONDS, not by token expiry;
+        # purging it here keeps one cron job for all credential cleanup.
+        purge_revocation_evidence()
