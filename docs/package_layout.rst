@@ -72,6 +72,7 @@ Package map
         bcp (RFC 9700 best-current-practice gates),
         safe_fetch (SSRF-hardened HTTPS fetching),
         rfc7523 (client-assertion protocol constant, shared by AS/RS/client),
+        resource_policy (RFC 8707 matching-policy version constants),
         backends_oauthlib, views.py (OAuthLibCoreMixin — shared view base)
       authorization_server/     provider side
         dcr, cimd, forms, admin,

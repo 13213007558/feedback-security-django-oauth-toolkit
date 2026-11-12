@@ -285,6 +285,32 @@ A security fix also changes who the token introspection endpoint answers.
 
   See :ref:`introspection-authorization`.
 
+A new resource-identifier policy is available, and it is opt-in.
+
+* **``RESOURCE_POLICY`` records which RFC 8707 matching rule a token was issued under.** The
+  default is ``"prefix"``, the historical behavior, so an upgrade changes no access decision and
+  needs no data step. Every grant, access token and refresh token gains a ``resource_policy``
+  field (migration ``0033``), blank on existing rows, which reads as version 1 (prefix). Run
+  ``migrate``; if you swapped any of the three token models, run ``makemigrations`` for your app
+  to add the field.
+
+  When you are ready to stop prefix matching, set ``RESOURCE_POLICY = "exact"`` and only new
+  authorizations and tokens are affected. Tokens already issued keep their recorded version, so a
+  live token is never narrowed behind the client's back. Refresh is deliberately constrained: an
+  exact refresh token never moves back to prefix, and a pre-switch refresh token issued with no
+  resource restriction cannot be refreshed unless the client names the resource it needs (it gets
+  ``invalid_target``). Clients that relied on refreshing an unrestricted pre-switch token should
+  be moved to a resource-bound authorization, or allowed to expire.
+
+  Existing rows can stay on prefix until they expire. ``manage.py resourcepolicy`` audits them and
+  ``--migrate`` moves only those whose resources are already distinct; unrestricted and overlapping
+  rows are reported, not rewritten, because moving them to exact would change what they authorize.
+  ``--purge-unsafe`` revokes them instead. See :ref:`resource-policy-transition`.
+
+  If you front the resource server with a reverse proxy, the exact matcher still normalizes scheme,
+  host, port, path spelling and query, so the existing ``SECURE_PROXY_SSL_HEADER`` /
+  ``USE_X_FORWARDED_HOST`` guidance applies unchanged.
+
 3.5 also drops the Django and Python versions that have reached end of life.
 
 * **Django 4.2, 5.0 and 5.1 and Python 3.10 are no longer supported (#1944).** Upgrade to Django

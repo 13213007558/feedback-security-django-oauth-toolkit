@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Versioned RFC 8707 resource-identifier matching. The new `RESOURCE_POLICY` setting selects
+  `"prefix"` (version 1, the historical base-URI rule and the default) or `"exact"` (version 2,
+  exact resource identifiers with address-format differences normalized) for newly issued grants
+  and tokens. Each `Grant`, `AccessToken` and `RefreshToken` records the version it was issued
+  under in a new `resource_policy` field (migration `0033`; a blank value means a row from before
+  the field, which keeps prefix matching), and validation applies that token's rule rather than
+  the current setting. The RFC 7662 introspection response publishes the version as a
+  `resource_policy` extension member beside `aud`, and the resource server caches it from a remote
+  introspection response. New `oauth2_provider.resource_server.validators` helpers
+  `validate_resource_as_exact_uri()`, `validate_resource_for_policy()` and
+  `resource_identifiers_equal()` implement and dispatch the rules. A refresh cannot widen: an exact
+  refresh token stays exact across a rollback, a prefix token moves to exact only when the client
+  names explicit resources, and a pre-switch refresh token with no resource restriction is refused
+  with `invalid_target` instead of minting another unrestricted token. The
+  `resourcepolicy` management command audits stored rows and moves only those whose resources are
+  already distinct; unrestricted, overlapping and invalid rows are reported and are left in place
+  unless `--purge-unsafe` revokes them. See `docs/resource_server.rst`.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

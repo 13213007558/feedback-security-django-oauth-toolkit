@@ -1010,6 +1010,7 @@ class AbstractGrant(models.Model):
     * :attr:`code_challenge` PKCE code challenge
     * :attr:`code_challenge_method` PKCE code challenge transform algorithm
     * :attr:`resource` RFC 8707 resource indicator(s), JSON-encoded array of URIs
+    * :attr:`resource_policy` RFC 8707 matching policy version for those URIs
     """
 
     CODE_CHALLENGE_PLAIN = "plain"
@@ -1055,6 +1056,11 @@ class AbstractGrant(models.Model):
     claims = models.TextField(blank=True, verbose_name=_("claims"))
 
     resource = ResourceJSONField(blank=True, default=list, verbose_name=_("resource"))
+    # The RFC 8707 matching policy this grant was approved under. Blank means a
+    # row from before the field existed: version 1, prefix matching.
+    resource_policy = models.CharField(
+        max_length=16, blank=True, default="", verbose_name=_("resource policy version")
+    )
 
     def is_expired(self):
         """
@@ -1107,6 +1113,7 @@ class AbstractAccessToken(models.Model):
     * :attr:`expires` Date and time of token expiration, in DateTime format
     * :attr:`scope` Allowed scopes
     * :attr:`resource` RFC 8707 resource indicator(s) - JSON-encoded array of URIs
+    * :attr:`resource_policy` RFC 8707 matching policy version for those URIs
     * :attr:`claims` The OIDC ``claims`` request (Core 5.5) the token was issued for
     """
 
@@ -1156,6 +1163,13 @@ class AbstractAccessToken(models.Model):
     scope = models.TextField(blank=True, verbose_name=_("scope"))
 
     resource = ResourceJSONField(blank=True, default=list, verbose_name=_("resource"))
+    # The RFC 8707 matching policy this token was issued under. Blank means a
+    # token from before the field existed: version 1, prefix matching. A resource
+    # server reads this per token so an upgrade cannot retroactively narrow a
+    # token the user already consented to.
+    resource_policy = models.CharField(
+        max_length=16, blank=True, default="", verbose_name=_("resource policy version")
+    )
     # The normalized OIDC claims request (Core 5.5) behind this token, so the UserInfo
     # endpoint and a refresh know which individual claims were requested.
     claims = ClaimsRequestJSONField(blank=True, default=dict, verbose_name=_("claims"))
@@ -1185,7 +1199,11 @@ class AbstractAccessToken(models.Model):
         Check if the token is authorized for the given audience URI.
 
         RFC 8707: Validates that the token includes the specified resource indicator
-        using the configured resource validator (RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR).
+        using the matching rule recorded on the token itself
+        (``resource_policy``). Version 1 (prefix) uses the configured
+        ``RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR``, so custom validators keep
+        working for legacy and prefix-policy tokens; version 2 (exact) always uses
+        exact resource-identifier matching and cannot be relaxed by that setting.
 
         If the token has no resource indicators (empty list), it is unrestricted and
         allows any audience (backward compatibility).
@@ -1199,13 +1217,11 @@ class AbstractAccessToken(models.Model):
             # regardless of how a custom validator treats an empty list.
             return True
 
-        resource_validator = oauth2_settings.RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR
+        # Imported here: resource_server.validators loads the models at import time,
+        # so a module-level import would be circular.
+        from .resource_server.validators import validate_resource_for_policy
 
-        if resource_validator:
-            return resource_validator(audience_uri, audiences)
-        else:
-            # No validator configured - allow everything (backward compat)
-            return True
+        return validate_resource_for_policy(audience_uri, audiences, self.resource_policy)
 
     def allow_scopes(self, scopes):
         """
@@ -1265,6 +1281,7 @@ class AbstractRefreshToken(models.Model):
                            bounded to
     * :attr:`revoked` Timestamp of when this refresh token was revoked
     * :attr:`resource` RFC 8707 resource indicator(s), JSON-encoded array of URIs
+    * :attr:`resource_policy` RFC 8707 matching policy version for those URIs
     """
 
     id = models.BigAutoField(primary_key=True)
@@ -1302,6 +1319,12 @@ class AbstractRefreshToken(models.Model):
     token_family = models.UUIDField(null=True, blank=True, editable=False, verbose_name=_("token family"))
 
     resource = ResourceJSONField(blank=True, default=list, verbose_name=_("resource"))
+    # The matching policy inherited from the authorization this token descends
+    # from. A refresh may only issue tokens under this policy or a narrower one,
+    # never under a newer policy that would widen the path it authorizes.
+    resource_policy = models.CharField(
+        max_length=16, blank=True, default="", verbose_name=_("resource policy version")
+    )
 
     created = models.DateTimeField(auto_now_add=True, verbose_name=_("created"))
     updated = models.DateTimeField(auto_now=True, verbose_name=_("updated"))

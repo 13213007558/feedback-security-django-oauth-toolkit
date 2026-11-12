@@ -9,6 +9,7 @@ from django.db import router
 
 from oauth2_provider.authorization_server.response_types import canonical_response_type
 from oauth2_provider.core.backends_oauthlib import JSONOAuthLibCore
+from oauth2_provider.core.resource_policy import SELECTABLE_RESOURCE_POLICIES
 from oauth2_provider.settings import coerce_expires_in, oauth2_settings
 
 
@@ -558,3 +559,27 @@ def validate_userinfo_jwt_expiry_configuration(
             )
         ]
     return []
+
+
+@checks.register(checks.Tags.security)
+def validate_resource_policy_configuration(
+    app_configs: Sequence[AppConfig] | None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    """
+    Report an unrecognised ``RESOURCE_POLICY`` at startup.
+
+    The value decides which RFC 8707 rule newly issued tokens record, and an unknown value must
+    not fall back to either matcher silently. The validator raises on it, which without this
+    check would reach the client as a 500 on the first issuance.
+    """
+    value = oauth2_settings.RESOURCE_POLICY
+    if value in SELECTABLE_RESOURCE_POLICIES:
+        return []
+    choices = ", ".join(repr(choice) for choice in SELECTABLE_RESOURCE_POLICIES)
+    return [
+        checks.Error(
+            f"OAUTH2_PROVIDER['RESOURCE_POLICY'] is {value!r}, which is not a resource matching policy.",
+            hint=f"Set it to one of {choices}.",
+            id="oauth2_provider.E009",
+        )
+    ]

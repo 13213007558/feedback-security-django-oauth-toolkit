@@ -11,6 +11,7 @@ from oauth2_provider.authorization_server.oidc.server import Server
 from oauth2_provider.core.checks import (
     validate_access_token_expiry_configuration,
     validate_refresh_token_configuration,
+    validate_resource_policy_configuration,
     validate_response_types_supported,
     validate_stored_authorization_request_model_setting,
     validate_swapped_model_consistency,
@@ -331,6 +332,26 @@ class UserInfoSigningServerCheckTestCase(TestCase):
 
     def test_an_unimportable_server_class_does_not_fail_the_check(self):
         self.assertEqual(self._messages(OIDC_SERVER_CLASS="tests.does_not_exist.Server"), [])
+
+
+@pytest.mark.usefixtures("oauth2_settings")
+class ResourcePolicyCheckTestCase(TestCase):
+    def _messages(self):
+        return [m for m in validate_resource_policy_configuration(None) if m.id == "oauth2_provider.E009"]
+
+    def test_supported_policies_pass(self):
+        for value in ("prefix", "exact"):
+            with self.subTest(value=value):
+                self.oauth2_settings.RESOURCE_POLICY = value
+                self.assertEqual(self._messages(), [])
+
+    def test_unknown_policy_is_an_error(self):
+        for value in ("", "wildcard", None):
+            with self.subTest(value=repr(value)):
+                self.oauth2_settings.RESOURCE_POLICY = value
+                (message,) = self._messages()
+                self.assertIsInstance(message, checks.Error)
+                self.assertIn("RESOURCE_POLICY", message.msg)
 
 
 @pytest.mark.usefixtures("oauth2_settings")

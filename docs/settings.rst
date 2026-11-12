@@ -1192,10 +1192,12 @@ RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR
 Default: ``"oauth2_provider.resource_server.validators.validate_resource_as_url_prefix"``
 (the pre-4.0 alias ``oauth2_provider.oauth2_validators.validate_resource_as_url_prefix`` still resolves).
 
-A callable that validates whether an access token's audience (RFC 8707 resource indicators) matches
-a request URI. The callable receives ``(request_uri, audiences)`` where ``request_uri`` is a string
-and ``audiences`` is a list of audience URIs from the token. Returns ``True`` if the token
-is authorized for the request, ``False`` otherwise.
+A callable that validates whether an access token whose ``resource_policy`` is version 1
+(``"prefix"``, including a token from before the field existed) matches a request URI. Exact-policy
+tokens never use this setting: they are always matched exactly (see ``RESOURCE_POLICY``).
+The callable receives ``(request_uri, audiences)`` where ``request_uri`` is a string and
+``audiences`` is a list of audience URIs from the token. Returns ``True`` if the token is
+authorized for the request, ``False`` otherwise.
 
 The default validator uses **prefix matching**: a token with audience ``https://api.example.com/v1``
 will accept requests to ``https://api.example.com/v1/users`` but reject ``https://api.example.com/v2``.
@@ -1209,20 +1211,39 @@ both a custom validator here (for matching on the resource server) and a custom
 ``OAUTH2_VALIDATOR_CLASS`` overriding ``_validate_resource_uris()`` (the authorization server
 rejects authority-less URIs at issuance).
 
-To use exact matching instead:
+To use exact matching for new tokens, use ``RESOURCE_POLICY`` instead of replacing this
+validator: the built-in exact matcher normalizes address-format differences and introspection
+publishes the policy, so every resource server applies the same rule. A custom validator here is
+a legacy/prefix-policy escape hatch and is ignored for exact-policy tokens.
 
-.. code-block:: python
+Set to ``None`` to disable audience validation for prefix-policy tokens. It has no effect on
+exact-policy tokens.
 
-    def exact_match_validator(request_uri, audiences):
-        if not audiences:
-            return True  # Unrestricted token
-        return request_uri in audiences
+RESOURCE_POLICY
+~~~~~~~~~~~~~~~
+Default: ``"prefix"``
 
-    OAUTH2_PROVIDER = {
-        'RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR': 'myapp.validators.exact_match_validator',
-    }
+Selects the RFC 8707 matching rule recorded on **newly issued** grants and tokens. It does not
+reinterpret tokens that already exist: each of those carries the version it was issued under.
 
-Set to ``None`` to disable automatic audience validation entirely.
+``"prefix"`` (version 1)
+    The audience URI is a base URI. A token for ``https://api.example.com/v1`` authorizes
+    ``https://api.example.com/v1/users``. This is the historical behavior and the default, so an
+    upgrade changes nothing until you opt in.
+
+``"exact"`` (version 2)
+    The request URI must be the same resource identifier as an audience. Address-format
+    differences are normalized away -- scheme and host case, an explicit default port, dot
+    segments, a trailing slash, and the query component -- but a different path is a different
+    permission and does not match. A token for ``https://api.example.com/v1`` therefore does
+    **not** authorize ``https://api.example.com/v1/users``. Under this policy the ``resource``
+    parameter must not carry a query component; it is refused with ``invalid_target``, since the
+    matcher cannot confine a token to it.
+
+The value is recorded on each ``Grant``, ``AccessToken`` and ``RefreshToken`` as
+``resource_policy`` (migration ``0033``; swapped models need their own migration). A token issued
+under exact matching stays exact even if the setting is later changed back, and a token issued
+under prefix matching stays prefix. See :ref:`resource-policy-transition`.
 
 AUTHENTICATION_SERVER_EXP_TIME_ZONE
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

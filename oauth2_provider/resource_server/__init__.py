@@ -26,6 +26,9 @@ _LAZY = {
     # RFC 8707 resource-indicator validation + bearer-token validator mixin.
     "ResourceServerValidatorMixin": "oauth2_provider.resource_server.validators",
     "validate_resource_as_url_prefix": "oauth2_provider.resource_server.validators",
+    "validate_resource_as_exact_uri": "oauth2_provider.resource_server.validators",
+    "validate_resource_for_policy": "oauth2_provider.resource_server.validators",
+    "resource_identifiers_equal": "oauth2_provider.resource_server.validators",
     "is_valid_resource_uri": "oauth2_provider.resource_server.validators",
     # Concrete protected-resource views.
     "ProtectedResourceView": "oauth2_provider.resource_server.views.generic",

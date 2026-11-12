@@ -223,6 +223,11 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
                 audiences = token.resource
                 if audiences:
                     data["aud"] = audiences
+                    # RFC 7662 section 2.2 lets an implementation add members. A resource
+                    # server checking the token locally needs the matching rule the token
+                    # was issued under: "exact" is exact resource identifiers, anything
+                    # else (including a token predating the field) is the old prefix rule.
+                    data["resource_policy"] = token.resource_policy or "prefix"
 
                 return JsonResponse(data)
             else:

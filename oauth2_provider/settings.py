@@ -329,6 +329,12 @@ DEFAULTS = {
     "RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR": (
         "oauth2_provider.resource_server.validators.validate_resource_as_url_prefix"
     ),
+    # RFC 8707 resource-identifier matching policy for newly issued grants and
+    # tokens. "prefix" (version 1) keeps the historical base-URI matching;
+    # "exact" (version 2) requires the request URI to be the resource identifier.
+    # Tokens record the policy they were issued under, so changing this only
+    # affects new issuances.
+    "RESOURCE_POLICY": "prefix",
     # Deprecated: introspection ``exp`` values are Unix timestamps interpreted as UTC per RFC 7662/
     # RFC 7519. Setting a non-UTC time zone re-enables the legacy workaround of reinterpreting the
     # ``exp`` wall-clock time in the configured time zone. Configuring it emits a DeprecationWarning

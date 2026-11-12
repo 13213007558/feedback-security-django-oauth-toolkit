@@ -94,6 +94,38 @@ def mocked_introspect_with_aud_list(url, data, *args, **kwargs):
     )
 
 
+def mocked_introspect_with_aud_and_policy(url, data, *args, **kwargs):
+    """Mock response carrying the exact-policy extension member beside aud."""
+    return MockResponse(
+        {
+            "active": True,
+            "scope": "read write dolphin",
+            "client_id": "client_id_aud",
+            "username": "aud_user",
+            "exp": int(calendar.timegm(default_exp.timetuple())),
+            "aud": ["https://api.example.com/v1"],
+            "resource_policy": "exact",
+        },
+        200,
+    )
+
+
+def mocked_introspect_with_aud_and_malformed_policy(url, data, *args, **kwargs):
+    """Mock response whose resource_policy is not a string."""
+    return MockResponse(
+        {
+            "active": True,
+            "scope": "read write dolphin",
+            "client_id": "client_id_aud",
+            "username": "aud_user",
+            "exp": int(calendar.timegm(default_exp.timetuple())),
+            "aud": ["https://api.example.com/v1"],
+            "resource_policy": 2,
+        },
+        200,
+    )
+
+
 def mocked_introspect_with_aud_string(url, data, *args, **kwargs):
     """Mock response with aud as a single string."""
     return MockResponse(
@@ -519,6 +551,32 @@ class TestTokenIntrospectionAuth(TestCase):
         )
         self.assertIsInstance(token, AccessToken)
         self.assertEqual(token.resource, ["https://api.example.com/v1", "https://data.example.com"])
+
+    @mock.patch("requests.post", side_effect=mocked_introspect_with_aud_and_policy)
+    def test_introspection_caches_exact_policy(self, mock_get):
+        """The cached token keeps the rule the authorization server published."""
+        token = self.validator._get_token_from_authentication_server(
+            "aud_token",
+            self.oauth2_settings.RESOURCE_SERVER_INTROSPECTION_URL,
+            self.oauth2_settings.RESOURCE_SERVER_AUTH_TOKEN,
+            self.oauth2_settings.RESOURCE_SERVER_INTROSPECTION_CREDENTIALS,
+        )
+        self.assertIsInstance(token, AccessToken)
+        self.assertEqual(token.resource_policy, "exact")
+        self.assertFalse(token.allows_audience("https://api.example.com/v1/users"))
+
+    @mock.patch("requests.post", side_effect=mocked_introspect_with_aud_and_malformed_policy)
+    def test_introspection_ignores_malformed_policy(self, mock_get):
+        """A non-string policy falls back to the historical prefix rule, never to exact."""
+        token = self.validator._get_token_from_authentication_server(
+            "aud_token",
+            self.oauth2_settings.RESOURCE_SERVER_INTROSPECTION_URL,
+            self.oauth2_settings.RESOURCE_SERVER_AUTH_TOKEN,
+            self.oauth2_settings.RESOURCE_SERVER_INTROSPECTION_CREDENTIALS,
+        )
+        self.assertIsInstance(token, AccessToken)
+        self.assertEqual(token.resource_policy, "")
+        self.assertTrue(token.allows_audience("https://api.example.com/v1/users"))
 
     @mock.patch("requests.post", side_effect=mocked_introspect_with_aud_string)
     def test_introspection_maps_aud_string_to_resource(self, mock_get):

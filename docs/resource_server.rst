@@ -316,7 +316,9 @@ by that resource server.
 Validating Token Audiences
 ---------------------------
 Django OAuth Toolkit automatically validates token audiences when using ``validate_bearer_token()``.
-By default, it uses **prefix-based matching** where the token's audience URI acts as a base URI.
+Each token records the matching **policy version** it was issued under, and validation applies that
+token's rule. The historical rule, and the default for new tokens, is **prefix-based matching**
+where the token's audience URI acts as a base URI.
 
 Automatic Validation
 ~~~~~~~~~~~~~~~~~~~~
@@ -345,6 +347,87 @@ validator. Supporting them requires customization on both sides: a custom
 accepts them at issuance, and a custom ``RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR`` so the
 resource server can match them.
 
+.. _resource-policy-transition:
+
+Switching to Exact Resource Identifiers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Prefix matching treats a resource indicator as a *base URI*, so a token for a tenant's
+``https://api.example.com/tenants/acme`` also authorizes every path below it. Exact matching treats
+it as an *identifier*: only that resource, with address-format differences normalized. Choose it
+when a path component is a security boundary (a tenant, a project, a per-resource endpoint) and a
+token must not travel to a sibling or child path.
+
+Set ``RESOURCE_POLICY = "exact"`` to issue new authorizations and tokens under version 2:
+
+.. code-block:: python
+
+    OAUTH2_PROVIDER = {
+        ...
+        "RESOURCE_POLICY": "exact",
+    }
+
+**Existing tokens keep working as they did.** Every grant, access token and refresh token stores
+the policy it was issued under in ``resource_policy``, and a blank value -- every row written before
+migration ``0033`` -- means version 1, prefix matching. Validation reads that field per token, so an
+upgrade never retroactively narrows a token the user already approved. A token issued under exact
+matching likewise stays exact if the setting is later changed back.
+
+The issued access token's version is returned to resource servers in two ways: the local
+``AccessToken.allows_audience()`` reads the field directly, and the RFC 7662 introspection response
+includes an extension member ``resource_policy`` (``"prefix"`` or ``"exact"``) whenever ``aud`` is
+present. A resource server that introspects a remote authorization server which does not publish
+that member treats the token as prefix policy; it never guesses "exact", which would narrow a live
+token on the client's behalf.
+
+Refreshing
+~~~~~~~~~~
+A refresh stays on the version the refresh token was issued under, and may only narrow:
+
+* An exact refresh token stays exact even if the deployment rolls ``RESOURCE_POLICY`` back to
+  ``"prefix"``, so a rollback cannot widen it.
+* A prefix refresh token for explicit resources stays prefix while the setting is prefix. Under an
+  exact deployment it moves to exact only when the client names its ``resource`` parameter on the
+  refresh, because naming resources is a narrowing that needs no new consent.
+* A **pre-switch refresh token issued with no resource restriction** cannot be refreshed "as
+  before": unrestricted cannot be narrowed, and issuing it under exact policy would still treat it
+  as unrestricted. Such a refresh gets ``invalid_target`` with a description saying so. The client
+  must name the ``resource`` it needs (which issues an exact token for that resource) or obtain a
+  new authorization.
+* A new token request that narrows an authorization code stays on the policy recorded when the
+  user approved the grant, whatever the current setting.
+
+Under exact matching a token request may spell a granted resource differently -- different case for
+scheme or host, an explicit default port, a trailing slash, dot segments -- and still count as the
+same resource. A different path is not a subset.
+
+Migrating Existing Authorizations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Leaving pre-switch rows on prefix policy is the safe default; they keep working until they expire.
+To apply exact matching to them sooner, audit first:
+
+.. code-block:: shell
+
+    python manage.py resourcepolicy            # report only (same as --audit)
+    python manage.py resourcepolicy --migrate  # move only the rows that cannot narrow
+
+The audit classifies each grant, access token and refresh token:
+
+* **migratable** -- one resource, or several that do not share a path prefix. Moving them to exact
+  changes no access decision.
+* **already exact** -- nothing to do.
+* **unrestricted** -- no ``resource``. Exact matching either keeps it unrestricted or silently
+  narrows every request, so it is not migrated.
+* **overlapping** -- resources such as ``https://api.example.com/v1`` and
+  ``https://api.example.com/v1/users``. Exact matching would remove the sub-path access prefix
+  matching granted, so they are not migrated.
+* **invalid** -- a resource value that does not parse, which cannot be represented under either
+  matcher.
+
+``--migrate`` rewrites only the migratable rows. Rows it flags are left untouched and reported; pass
+``--purge-unsafe`` with ``--migrate`` to revoke them instead, which is the only safe way to stop
+honoring them. Refresh tokens are revoked through the model, so their access tokens are deleted with
+them. The command never writes a narrower policy onto an unsafe row.
+
 Deployments Behind a Reverse Proxy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Audience validation compares the token's resource indicators against the request URI as
@@ -369,26 +452,29 @@ the security implications of these settings.
 
 Custom Validation Logic
 ~~~~~~~~~~~~~~~~~~~~~~~~
-You can customize the validation logic by providing your own validator function:
+``RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR`` customizes matching for tokens on version 1
+(prefix policy), which includes every token issued before the policy field existed. Exact-policy
+tokens always use the built-in exact matcher: a permissive custom validator must not re-open a
+token that was issued under the stricter rule.
 
 .. code-block:: python
 
     # myapp/validators.py
-    def exact_match_validator(request_uri, audiences):
-        """Custom validator that requires exact audience match."""
+    def origin_match_validator(request_uri, audiences):
+        """Version 1 example: compare only the origin (scheme, host and port)."""
         # No audiences = unrestricted token (backward compat)
         if not audiences:
             return True
-
-        # Require exact match
-        return request_uri in audiences
+        request_origin = request_uri.split("/", 3)[:3]
+        return any(audience.split("/", 3)[:3] == request_origin for audience in audiences)
 
     # settings.py
     OAUTH2_PROVIDER = {
-        'RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR': 'myapp.validators.exact_match_validator',
+        'RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR': 'myapp.validators.origin_match_validator',
     }
 
-To disable automatic validation entirely, set the validator to ``None``:
+To disable automatic validation for prefix-policy tokens, set the validator to ``None``. It has no
+effect on exact-policy tokens:
 
 .. code-block:: python
 

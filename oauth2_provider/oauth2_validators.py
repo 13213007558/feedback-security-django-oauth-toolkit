@@ -8,11 +8,12 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlsplit
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.hashers import check_password, identify_hasher
+from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError, router, transaction
 from django.http import HttpRequest
 from django.utils import dateformat, timezone
@@ -37,6 +38,12 @@ from .authorization_server.oidc.server import signs_userinfo_for
 from .authorization_server.response_modes import response_mode_permitted
 from .core.bcp import bcp_compliant
 from .core.exceptions import FatalClientError
+from .core.resource_policy import (
+    RESOURCE_POLICY_EXACT,
+    RESOURCE_POLICY_PREFIX,
+    SELECTABLE_RESOURCE_POLICIES,
+    selected_resource_policy,
+)
 from .core.scopes import get_scopes_backend
 from .core.utils import jwk_from_pem
 from .models import (
@@ -63,12 +70,16 @@ from .resource_server.validators import (
     ResourceServerValidatorMixin,
     _parse_and_validate_uri,
     is_valid_resource_uri,
+    resource_identifiers_equal,
+    validate_resource_as_exact_uri,
     validate_resource_as_url_prefix,
+    validate_resource_for_policy,
 )
 from .settings import coerce_expires_in, oauth2_settings
 
 
-# Public API of this module. ``is_valid_resource_uri`` and
+# Public API of this module. ``is_valid_resource_uri``,
+# ``validate_resource_as_exact_uri``, ``validate_resource_for_policy`` and
 # ``validate_resource_as_url_prefix`` are re-exported from
 # ``resource_server.validators`` for backward compatibility (listing them here
 # also marks the re-export imports above as intentional public API).
@@ -76,7 +87,10 @@ __all__ = [
     "OAuth2Validator",
     "GRANT_TYPE_MAPPING",
     "is_valid_resource_uri",
+    "resource_identifiers_equal",
+    "validate_resource_as_exact_uri",
     "validate_resource_as_url_prefix",
+    "validate_resource_for_policy",
 ]
 
 
@@ -656,12 +670,29 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         with transaction.atomic(using=router.db_for_write(AccessToken)):
             return self._save_bearer_token(token, request, *args, **kwargs)
 
+    def get_resource_policy(self, request=None):
+        """Policy version to record on newly issued grants and tokens.
+
+        ``RESOURCE_POLICY`` selects it: ``"prefix"`` (version 1, the historical
+        base-URI rule) or ``"exact"`` (version 2, exact resource identifiers).
+        The default is ``"prefix"``, so an upgrade changes nothing until an
+        operator opts in. An unknown value is a configuration error rather than a
+        silent fallback, since which one applies decides access.
+        """
+        policy = oauth2_settings.RESOURCE_POLICY
+        if policy not in SELECTABLE_RESOURCE_POLICIES:
+            raise ImproperlyConfigured(
+                "OAUTH2_PROVIDER['RESOURCE_POLICY'] must be one of "
+                f"{', '.join(repr(value) for value in SELECTABLE_RESOURCE_POLICIES)}; got {policy!r}."
+            )
+        return policy
+
     def _validate_resource_uris(self, request, resources):
         """
         RFC 8707: Reject any resource that is not an absolute URI with a scheme
         and host (no userinfo or fragment). Note this is stricter than RFC 3986
-        absolute-URI: authority-less forms such as URNs are rejected because the
-        default prefix validator matches on (scheme, host, port, path).
+        absolute-URI: authority-less forms such as URNs are rejected because both
+        built-in matchers compare on (scheme, host, port, path).
         """
         for res in resources:
             if _parse_and_validate_uri(res) is None:
@@ -674,14 +705,47 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
                     request=request,
                 )
 
+    def _validate_resource_uris_for_policy(self, request, resources, policy):
+        """Validate *resources* for the version they will be stored under.
+
+        Runs the overridable :meth:`_validate_resource_uris` hook first, then
+        applies the one rule that depends on the version: under exact matching a
+        query component is refused. It is part of neither built-in matcher's
+        identity, so storing one would claim a restriction the matcher does not
+        enforce. Prefix-policy values keep the historical allowance, because the
+        query already plays no part there.
+        """
+        self._validate_resource_uris(request, resources)
+        if selected_resource_policy(policy) != RESOURCE_POLICY_EXACT:
+            return
+        for res in resources:
+            if urlsplit(res).query:
+                raise errors.CustomOAuth2Error(
+                    error="invalid_target",
+                    description=(
+                        f"The resource '{res}' is not a valid resource indicator under exact "
+                        "matching: a query component is not part of the identifier, so the "
+                        "token could not be confined to it."
+                    ),
+                    request=request,
+                )
+
     def _check_and_set_request_resource(self, request):
         """
         Handle 'resource' parameter from token requests (RFC 8707).
-        Normalizes request.resource to a list of URIs.
+        Normalizes request.resource to a list of URIs and sets request.resource_policy
+        to the version the issued tokens will be recorded under.
 
         request.resource will be set to one of:
         - [] (no resources)
         - List of URIs: ["https://api.example.com"] or ["https://a.com", "https://b.com"]
+
+        The policy comes from the authorization this request descends from, never
+        from the current setting: a token request that narrows an already approved
+        grant stays on the version the user consented to. The current setting is
+        consulted only for a grant that names no resources, where nothing was
+        recorded at the authorization endpoint. A refresh inherits the refresh
+        token's version outright, so it can neither change nor launder it.
         """
         resource = getattr(request, "resource", None)
 
@@ -704,19 +768,31 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         else:
             request.resource = []
 
-        # RFC 8707: Validate that each resource is an absolute URI with scheme and host
-        self._validate_resource_uris(request, request.resource)
+        # Resolve the version first: validation depends on it (exact matching
+        # refuses a query component the matcher would ignore), and so does the
+        # answer the issued token must carry.
+        request.resource_policy = self.get_resource_policy(request)
 
         if request.grant_type == "authorization_code":
             # Handle grant resource narrowing
             grant = Grant.objects.filter(code=request.code, application=request.client).first()
             grant_resource = (grant.resource or []) if grant else []
+            # The version recorded when the user approved the grant.
+            request.resource_policy = self._grant_resource_policy(grant)
+        elif request.grant_type == "refresh_token":
+            refresh_token_instance = getattr(request, "refresh_token_instance", None)
+            if refresh_token_instance:
+                request.resource_policy = self._refresh_resource_policy(request, refresh_token_instance)
 
+        # RFC 8707: Validate that each resource is an absolute URI with scheme and host
+        self._validate_resource_uris_for_policy(request, request.resource, request.resource_policy)
+
+        if request.grant_type == "authorization_code":
             if request.resource and grant_resource:
                 # Token request is narrowing the resource scope
                 # Validate that requested resources are a subset of granted resources
                 for res in request.resource:
-                    if res not in grant_resource:
+                    if not self._resource_is_subset(res, grant_resource, request.resource_policy):
                         raise errors.CustomOAuth2Error(
                             error="invalid_target",
                             description=(
@@ -730,24 +806,25 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
                 # Inherited values may predate validation at the authorization
                 # endpoint (e.g. rows written before upgrading) - validate them
                 # before they end up on the issued token.
-                self._validate_resource_uris(request, grant_resource)
+                self._validate_resource_uris_for_policy(request, grant_resource, request.resource_policy)
                 request.resource = grant_resource
 
         elif request.grant_type == "refresh_token":
             # Preserve resource from the refresh token
-            refresh_token_instance = getattr(request, "refresh_token_instance", None)
             if refresh_token_instance and refresh_token_instance.resource:
                 # If no resource specified in request, inherit from refresh token
                 if not request.resource:
                     # Validate inherited values the same way as client-supplied ones.
-                    self._validate_resource_uris(request, refresh_token_instance.resource)
+                    self._validate_resource_uris_for_policy(
+                        request, refresh_token_instance.resource, request.resource_policy
+                    )
                     request.resource = refresh_token_instance.resource
                 # If resource specified, validate it's a subset of refresh token's resources
                 elif request.resource != refresh_token_instance.resource:
                     refresh_list = refresh_token_instance.resource
 
                     for res in request.resource:
-                        if res not in refresh_list:
+                        if not self._resource_is_subset(res, refresh_list, request.resource_policy):
                             raise errors.CustomOAuth2Error(
                                 error="invalid_target",
                                 description=(
@@ -757,6 +834,83 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
                                 ),
                                 request=request,
                             )
+
+    @staticmethod
+    def _resource_is_subset(resource, allowed, policy):
+        """Whether *resource* is one of the identifiers in *allowed*.
+
+        Under exact matching spelling differences that do not change the
+        identifier (case, default port, dot segments, trailing slash, query) are
+        equal, so a token request may name the same resource differently from the
+        grant. Prefix-policy grants keep the historical exact string subset test:
+        their matcher is prefix-based, and a spelling difference there changes
+        which paths match.
+        """
+        if selected_resource_policy(policy) == RESOURCE_POLICY_EXACT:
+            return any(resource_identifiers_equal(resource, entry) for entry in allowed)
+        return resource in allowed
+
+    def _refresh_resource_policy(self, request, refresh_token_instance):
+        """The policy a refreshed token may be issued under.
+
+        A refresh may keep the version the refresh token was issued under, or move
+        to a narrower one; it may never move to a wider one. Concretely:
+
+        * An exact-policy refresh token stays exact even if the setting has been
+          rolled back to ``prefix``: a deployment rollback must not widen tokens
+          that were issued under the stricter rule.
+        * A legacy (blank) or prefix-policy refresh token stays on prefix while the
+          setting is prefix (nothing changes), and moves to exact when the client
+          names explicit resources under an exact deployment -- naming them is a
+          narrowing, so it needs no new consent.
+        * A legacy refresh token with **no** resources was unrestricted, and an
+          exact deployment must not keep minting unrestricted tokens from it: no
+          resource list cannot be narrowed, so the client has to re-authorize.
+          Refreshing without ``resource`` is refused with ``invalid_target`` and
+          an explicit description rather than silently continuing the old, wider
+          authorization.
+
+        Exact policy with no resources is still checked by ``allows_audience`` as
+        unrestricted, which is why the unrestricted legacy case is refused here
+        instead of being issued as exact.
+        """
+        source_policy = selected_resource_policy(refresh_token_instance.resource_policy)
+        current_policy = self.get_resource_policy(request)
+
+        if source_policy == RESOURCE_POLICY_EXACT:
+            return RESOURCE_POLICY_EXACT
+        if current_policy == RESOURCE_POLICY_PREFIX:
+            return RESOURCE_POLICY_PREFIX
+        if request.resource:
+            return RESOURCE_POLICY_EXACT
+        if not (refresh_token_instance.resource or []):
+            raise errors.CustomOAuth2Error(
+                error="invalid_target",
+                description=(
+                    "This refresh token is from an authorization with no resource restriction, "
+                    "issued before exact resource matching was enabled. It cannot be refreshed "
+                    "without naming the resource(s) it is for: refresh with a 'resource' "
+                    "parameter, or obtain a new authorization."
+                ),
+                request=request,
+            )
+        return RESOURCE_POLICY_PREFIX
+
+    def _grant_resource_policy(self, grant):
+        """The policy to record for tokens issued from *grant*.
+
+        The grant records the version approved at the authorization endpoint. A
+        grant without resource values has nothing to record (its tokens are
+        unrestricted and never audience-checked), so the current setting is used
+        for the tokens' field. A legacy grant (blank policy) that does name
+        resources keeps version 1: its values were approved under prefix
+        matching and an upgrade must not narrow them silently.
+        """
+        if grant is None:
+            return self.get_resource_policy()
+        if not (grant.resource or []):
+            return self.get_resource_policy()
+        return selected_resource_policy(grant.resource_policy)
 
     def _save_bearer_token(self, token, request, *args, **kwargs):
         """
@@ -812,6 +966,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
                 self._set_token_value(access_token, token["access_token"])
                 access_token.application = request.client
                 access_token.resource = getattr(request, "resource", [])  # RFC 8707
+                access_token.resource_policy = getattr(request, "resource_policy", "") or ""  # RFC 8707
                 access_token.save()
 
             # else create fresh with access & refresh tokens
@@ -911,6 +1066,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             application=request.client,
             source_refresh_token=source_refresh_token,
             resource=getattr(request, "resource", []),  # RFC 8707
+            resource_policy=getattr(request, "resource_policy", "") or "",  # RFC 8707
             claims=self._claims_request_to_store(request),  # OIDC Core 5.5
         )
         self._set_token_value(access_token, token["access_token"])
@@ -958,6 +1114,9 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             acr=self._get_id_token_acr(request) or "",
             claims=json.dumps(request.claims or {}),
             resource=resource,
+            # Record the matching rule the resource owner approved, so later token
+            # requests and refreshes stay on it even if the setting changes.
+            resource_policy=self.get_resource_policy(request),
         )
 
     def _create_refresh_token(self, request, refresh_token_code, access_token, previous_refresh_token):
@@ -971,6 +1130,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             access_token=access_token,
             token_family=token_family,
             resource=getattr(request, "resource", []),  # RFC 8707
+            resource_policy=getattr(request, "resource_policy", "") or "",  # RFC 8707
         )
         self._set_token_value(refresh_token, refresh_token_code)
         try:

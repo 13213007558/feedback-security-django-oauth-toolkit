@@ -317,7 +317,9 @@ This identifies your application, the user is asked to authorize your applicatio
    The parameter is accepted on both the authorization and token endpoints; a token
    request may repeat ``resource`` to narrow the token to a subset of the resources
    authorized in the grant. This prevents the token from being used at other resource
-   servers. See :doc:`resource_server` for details on validating token audiences.
+   servers. The ``RESOURCE_POLICY`` setting chooses whether the identifier also covers
+   paths below it (``"prefix"``, the default) or only itself (``"exact"``). See
+   :doc:`resource_server` for details on validating token audiences and on switching.
 
 Go ahead and authorize the ``web-app``
 

@@ -34,6 +34,7 @@ from jwcrypto.common import JWException
 # this resource server an OAuth *client*, so the assertion builder comes from the
 # client package.
 from oauth2_provider.client.client_assertions import make_client_assertion
+from oauth2_provider.core.resource_policy import RESOURCE_POLICY_EXACT, selected_resource_policy
 from oauth2_provider.core.rfc7523 import JWT_BEARER_CLIENT_ASSERTION_TYPE
 from oauth2_provider.core.utils import get_timezone
 from oauth2_provider.models import get_access_token_model
@@ -96,6 +97,50 @@ def is_valid_resource_uri(uri):
     return _parse_and_validate_uri(uri) is not None
 
 
+def resource_identifiers_equal(left, right):
+    """Compare two resource identifiers by identity, not spelling.
+
+    Both values are parsed and compared component by component, so address-format
+    differences -- scheme or host case, an explicit default port, dot segments, or
+    a trailing slash -- are equal, while a different path (a different permission)
+    is not. A value that cannot be parsed falls back to string equality, so an
+    unparseable legacy value never compares equal to a valid one.
+    """
+    left_parts = _parse_and_validate_uri(left)
+    right_parts = _parse_and_validate_uri(right)
+    if left_parts is None or right_parts is None:
+        return left == right
+    return left_parts == right_parts
+
+
+def validate_resource_as_exact_uri(request_uri, audiences):
+    """Version 2 resource validator: exact resource-identifier matching.
+
+    The request URI must be the same resource identifier as one of the token's
+    audiences. Address-format differences are normalized away (scheme and host
+    case, an explicit default port, dot segments, a trailing slash, and the query
+    component, which RFC 8707 permits but which plays no part in matching here).
+    A different path is a different permission and does not match, so a token for
+    ``https://api.example.com/v1`` does **not** authorize
+    ``https://api.example.com/v1/users``.
+
+    Both values must be absolute URIs with a scheme and host, as for the prefix
+    validator; an unparseable value never matches.
+    """
+    if not audiences:
+        return True
+
+    request_parts = _parse_and_validate_uri(request_uri)
+    if request_parts is None:
+        return False
+
+    for audience in audiences:
+        if _parse_and_validate_uri(audience) == request_parts:
+            return True
+
+    return False
+
+
 def validate_resource_as_url_prefix(request_uri, audiences):
     """
     Default resource validator using URL prefix matching (RFC 8707).
@@ -148,6 +193,24 @@ def validate_resource_as_url_prefix(request_uri, audiences):
             return True
 
     return False
+
+
+def validate_resource_for_policy(request_uri, audiences, policy):
+    """Apply the matcher selected by the token's ``policy`` version.
+
+    Version 1 (``prefix``) keeps the historical behavior, including a custom
+    ``RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR``. Version 2 (``exact``) always
+    uses :func:`validate_resource_as_exact_uri`: a token recorded as exact must
+    not be re-opened by a permissive custom prefix validator. A blank policy is
+    a row from before the field existed and therefore version 1.
+    """
+    if selected_resource_policy(policy) == RESOURCE_POLICY_EXACT:
+        return validate_resource_as_exact_uri(request_uri, audiences)
+
+    resource_validator = oauth2_settings.RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR
+    if resource_validator:
+        return resource_validator(request_uri, audiences)
+    return True
 
 
 class ResourceServerValidatorMixin:
@@ -268,6 +331,19 @@ class ResourceServerValidatorMixin:
                 log.warning("Rejecting token: malformed 'aud' claim in introspection response: %r", aud)
                 return None
 
+            # The matching rule the authorization server says the token was issued
+            # under. Absent (a remote server that does not publish it) means the
+            # historical prefix rule, which is what this toolkit applied before the
+            # version was recorded; never guess "exact" for a token that does not
+            # say so, since that would narrow a live token on the client's behalf.
+            resource_policy = content.get("resource_policy", "")
+            if not isinstance(resource_policy, str):
+                log.warning(
+                    "Ignoring malformed 'resource_policy' claim in introspection response: %r",
+                    resource_policy,
+                )
+                resource_policy = ""
+
             token_checksum = hashlib.sha256(token.encode("utf-8")).hexdigest()
             # Respect hashed-at-rest storage (RFC 9700): the resource-server token cache
             # is looked up by checksum, so it must not persist the cleartext token when
@@ -282,6 +358,7 @@ class ResourceServerValidatorMixin:
                     "scope": scope,
                     "expires": expires,
                     "resource": aud,
+                    "resource_policy": resource_policy,
                 },
             )
 
