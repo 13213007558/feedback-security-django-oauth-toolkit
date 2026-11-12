@@ -93,7 +93,7 @@ Upgrading to 3.0
   the codebase and still find ``validate_logout_request``, that method is expected to be there.
 * **Token cleanup writes now honor database routers (#1450).** If you run a multi-database setup,
   ensure your routers direct the token models to the correct database (see
-  :ref:`the multiple-databases note <extend_token_models>`).
+  :ref:`the multiple-databases note <multiple_databases>`).
 
 Upgrading to 3.4.1
 ------------------

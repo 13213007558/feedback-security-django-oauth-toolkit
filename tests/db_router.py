@@ -74,3 +74,52 @@ class CrossDatabaseRouter:
         if model_name == "accesstoken":
             return db == "beta"
         return None
+
+
+class SplitTokenRouter:
+    """
+    Put ``AccessToken`` on ``split_beta`` and every other token on ``split_alpha``.
+
+    This is the configuration the startup check must reject. Unlike
+    ``CrossDatabaseRouter`` it permits relations across the two aliases, so a test that
+    wants to exercise the write paths past the check is not stopped by Django at
+    assignment time. Reads follow writes here; ``SplitTokenReadRouter`` below makes them
+    disagree to exercise the read-routing half of the check. The aliases are distinct
+    from the ``alpha``/``beta`` aliases in ``tests.multi_db_settings`` so the same test
+    runs under both settings modules.
+    """
+
+    def db_for_read(self, model, **hints):
+        if model._meta.model_name == "accesstoken":
+            return "split_beta"
+        return "split_alpha"
+
+    def db_for_write(self, model, **hints):
+        if model._meta.model_name == "accesstoken":
+            return "split_beta"
+        return "split_alpha"
+
+    def allow_relation(self, obj1, obj2, **hints):
+        if {obj1._state.db, obj2._state.db} <= {"split_alpha", "split_beta"}:
+            return True
+        return None
+
+    def allow_migrate(self, db, app_label, model_name=None, **hints):
+        if model_name == "accesstoken":
+            return db == "split_beta"
+        return db == "split_alpha"
+
+
+class SplitTokenReadRouter:
+    """Like ``SplitTokenRouter``, but ``db_for_read`` and ``db_for_write`` disagree."""
+
+    def db_for_read(self, model, **hints):
+        return "split_alpha"
+
+    def db_for_write(self, model, **hints):
+        if model._meta.model_name == "accesstoken":
+            return "split_beta"
+        return "split_alpha"
+
+    allow_relation = SplitTokenRouter.allow_relation
+    allow_migrate = SplitTokenRouter.allow_migrate

@@ -33,15 +33,38 @@ class DjangoChecksTestCase(TestCase):
         DATABASE_ROUTERS=["tests.db_router.CrossDatabaseRouter", "tests.db_router.AlphaRouter"]
     )
     def test_checks_fail_when_router_crosses_databases(self):
-        message = "The token models are expected to be stored in the same database."
+        message = "The token models are expected to be stored in the same database;"
         with self.assertRaisesMessage(SystemCheckError, message):
             call_command("check")
 
+    def test_check_reports_aliases_and_id_for_split_writes(self):
+        with override_settings(DATABASE_ROUTERS=["tests.db_router.SplitTokenRouter"]):
+            messages = validate_token_configuration(None)
+        self.assertEqual([message.id for message in messages], ["oauth2_provider.E009"])
+        # The message names the resolved aliases, so an operator can find the router rule
+        # that has to change instead of only being told the models are split.
+        self.assertIn("AccessToken read=split_beta", messages[0].msg)
+        self.assertIn("RefreshToken write=split_alpha", messages[0].msg)
+
+    def test_check_reports_read_write_disagreement(self):
+        # A router may resolve db_for_read differently from db_for_write. The check used
+        # to compare db_for_write only, but select_related("access_token"), forward FKs
+        # and source_refresh_token lookups all read through db_for_read.
+        with override_settings(DATABASE_ROUTERS=["tests.db_router.SplitTokenReadRouter"]):
+            messages = validate_token_configuration(None)
+        self.assertEqual([message.id for message in messages], ["oauth2_provider.E009"])
+
+    def test_check_accepts_one_alias_even_if_not_default(self):
+        # AlphaRouter routes every token role to alpha. One non-default alias is valid:
+        # the requirement is that all roles agree, not that they use ``default``.
+        with override_settings(DATABASE_ROUTERS=["tests.db_router.AlphaRouter"]):
+            self.assertEqual(validate_token_configuration(None), [])
+
     def test_token_configuration_check_runs_without_a_database_alias(self):
         # Django 6.1 skips `database`-tagged checks unless an alias is passed explicitly
-        # (`manage.py check --database default`). This check only asks the routers where the
-        # token models would be written -- it never opens a connection -- so it must not carry
-        # that tag, or a plain `manage.py check` would silently stop running it.
+        # (`manage.py check --database default`). This check only asks the routers where
+        # the token models would be written -- it never opens a connection -- so it must
+        # not carry that tag, or a plain `manage.py check` would silently stop running it.
         self.assertNotIn(checks.Tags.database, validate_token_configuration.tags)
         self.assertIn(checks.Tags.models, validate_token_configuration.tags)
 

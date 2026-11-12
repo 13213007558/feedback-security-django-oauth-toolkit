@@ -388,16 +388,48 @@ Then run ``makemigrations`` and ``migrate``. On a fresh database this works out 
     ``django.db.migrations.operations.SeparateDatabaseAndState`` to decouple the state from the
     schema changes.
 
+.. _multiple_databases:
+
 Configuring multiple databases
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-There is no requirement that the tokens are stored in the default database or that there is a
-default database provided the database routers can determine the correct Token locations. Because the
-Tokens have foreign keys to the ``User`` model, you likely want to keep the tokens in the same database
-as your User model. It is also important that all of the tokens are stored in the same database.
-This could happen for instance if one of the Tokens is locally overridden and stored in a separate database.
-The reason for this is transactions will only be made for the database where AccessToken is stored
-even when writing to RefreshToken or other tokens.
+There is no requirement that the tokens are stored in the default database, or that a
+``default`` database exists at all, provided the database routers can determine the correct
+token locations. Because the tokens have foreign keys to the ``User`` model, you likely want
+to keep the tokens in the same database as your ``User`` model.
+
+All three token models -- ``AccessToken``, ``RefreshToken`` and ``IDToken`` -- must resolve,
+for both ``db_for_read`` and ``db_for_write``, to a **single** database. ``manage.py check``
+reports ``oauth2_provider.E009`` at startup when they do not. This is not a stylistic
+restriction:
+
+* :meth:`~oauth2_provider.oauth2_validators.OAuth2Validator.save_bearer_token` opens one
+  ``transaction.atomic`` on the ``AccessToken`` database and then writes the refresh and ID
+  token rows through their own managers. If the models are split, the block rolls back the
+  access token while the refresh token insert has already committed on the other database:
+  the client gets a failed grant response but a refresh row remains. In the reverse order,
+  rotation can commit a successor refresh token whose access token never committed.
+* :meth:`RefreshToken.revoke_family` and :meth:`RefreshToken.revoke` update the refresh rows
+  in one transaction and delete or update the access rows in another. A replay of a revoked
+  refresh token can therefore revoke the family in the refresh database while the access
+  token it already minted stays valid in the access database. That defeats RFC 9700
+  section 4.14.2 reuse protection.
+* ``validate_refresh_token`` looks up the refresh token with
+  ``select_related("access_token")``. That is a single SQL statement, and a single statement
+  cannot join across two database connections, so refresh requests fail closed.
+
+Making this work would need a compensating protocol rather than a router change: a durable
+outbox or saga that records the intent before the first commit, retries the second database's
+half from that record, and a reconciliation sweep that deletes orphaned access tokens and
+re-revokes their families. Each step must also be idempotent, because the retry may follow a
+commit whose response was lost. That protocol is more code and more failure modes than keeping
+the tables together; this library does not implement it and reports the split configuration as
+unsupported instead.
+
+If you need to scale tokens separately, keep the token tables on one database and scale it
+(the token rows are indexed and mostly insert/delete traffic). Use replication or read
+replicas only for read-only reporting, not for token lookups whose freshness a grant or
+revocation depends on.
 
 Multiple Grants
 ~~~~~~~~~~~~~~~

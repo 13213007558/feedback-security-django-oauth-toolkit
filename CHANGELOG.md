@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* #1944 A system check (`oauth2_provider.E009`) that rejects routing the token models to
+  different databases. It now compares `db_for_read` as well as `db_for_write`, because
+  `select_related("access_token")` and forward-FK lookups read through `db_for_read`. The
+  error names the resolved alias for each token role. Issuance, rotation and refresh-token
+  family revocation each depend on one atomic transaction spanning the token tables, and a
+  cross-database split leaves committed half-states (orphaned refresh tokens, revoked
+  families whose access tokens remain valid) that a router change cannot fix. The message
+  and hint explain the supported configuration: all three token models on one alias.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

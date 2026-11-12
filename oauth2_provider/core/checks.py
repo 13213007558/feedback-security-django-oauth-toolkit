@@ -224,30 +224,70 @@ def validate_request_body_configuration(app_configs, **kwargs):
 
 
 # Registered under the ``models`` tag rather than ``database``: this check only asks the
-# configured routers where the token models would be written, which is static analysis and
-# never opens a connection. Django 6.1 stopped running ``database``-tagged checks unless a
-# database alias is passed explicitly (``manage.py check --database default``), because
-# those checks may do more than static analysis -- keeping this one under that tag would
-# silently disable it for everyone running a plain ``manage.py check``.
+# configured routers where the token models would be read and written, which is static
+# analysis and never opens a connection. Django 6.1 stopped running ``database``-tagged
+# checks unless a database alias is passed explicitly (``manage.py check --database
+# default``), because those checks may do more than static analysis -- keeping this one
+# under that tag would silently disable it for everyone running a plain ``manage.py check``.
 @checks.register(checks.Tags.models)
 def validate_token_configuration(app_configs, **kwargs):
-    databases = set(
-        router.db_for_write(apps.get_model(model))
-        for model in (
-            oauth2_settings.ACCESS_TOKEN_MODEL,
-            oauth2_settings.ID_TOKEN_MODEL,
-            oauth2_settings.REFRESH_TOKEN_MODEL,
-        )
-    )
+    """
+    Reject token models that routing places on more than one database.
 
-    # This is highly unlikely, but let's warn people just in case it does.
-    # If the tokens were allowed to be in different databases this would require all
-    # writes to have a transaction around each database. Instead, let's enforce that
-    # they all live together in one database.
-    # The tokens are not required to live in the default database provided the Django
-    # routers know the correct database for them.
+    The token write paths open a single ``transaction.atomic`` scoped to the
+    ``AccessToken`` database and then write the ``RefreshToken`` and ``IDToken`` rows
+    through their own managers. Splitting the models across databases therefore produces
+    two independently committed transactions, which cannot be made atomic without
+    two-phase commit:
+
+    * issuance/rotation can commit a new access token and then fail to commit its refresh
+      token (or the reverse), leaving an orphan the next refresh rejects;
+    * ``RefreshToken.revoke_family`` and ``RefreshToken.revoke`` update the refresh row in
+      one transaction and delete the access rows in another, so reuse protection can
+      revoke the family in one database while the stolen access token stays usable in the
+      other;
+    * ``validate_refresh_token`` joins ``RefreshToken`` to its ``AccessToken`` with
+      ``select_related``, which is one SQL statement and can only run against one
+      database.
+
+    Read routing must agree with write routing: the join, ``source_refresh_token``
+    lookups and ``refresh_token.revoke()`` all read the other model through the router.
+    ``db_for_read`` defaults to ``db_for_write`` when a router returns ``None`` for both,
+    but a router may return different aliases for the two actions.
+
+    The tokens are not required to live in the default database, provided the routers
+    route all three models to the same alias.
+    """
+    models = {
+        "AccessToken": apps.get_model(oauth2_settings.ACCESS_TOKEN_MODEL),
+        "RefreshToken": apps.get_model(oauth2_settings.REFRESH_TOKEN_MODEL),
+        "IDToken": apps.get_model(oauth2_settings.ID_TOKEN_MODEL),
+    }
+    # Report where each role resolves. The message lists the aliases so an operator can
+    # see which router rule has to change; a set comparison alone would only say "no".
+    routes = {
+        (role, action): getattr(router, f"db_for_{action}")(model)
+        for role, model in models.items()
+        for action in ("read", "write")
+    }
+    databases = set(routes.values())
     if len(databases) > 1:
-        return [checks.Error("The token models are expected to be stored in the same database.")]
+        detail = ", ".join(
+            f"{role} {action}={alias}" for (role, action), alias in sorted(routes.items())
+        )
+        return [
+            checks.Error(
+                "The token models are expected to be stored in the same database; the "
+                f"configured routers place them on {len(databases)}: {detail}.",
+                hint=(
+                    "Route ACCESS_TOKEN_MODEL, REFRESH_TOKEN_MODEL and ID_TOKEN_MODEL to "
+                    "one database, and make db_for_read agree with db_for_write for each. "
+                    "Issuance, rotation and refresh-token family revocation each need one "
+                    "atomic transaction across those tables."
+                ),
+                id="oauth2_provider.E009",
+            )
+        ]
 
     return []
 
