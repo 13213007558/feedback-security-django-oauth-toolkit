@@ -83,6 +83,30 @@ Device-confirm endpoint
 
 .. image:: ../_images/device-approve-deny.png
 
+The confirmation page also offers a **Cancel** button, which POSTs to the
+``oauth2_provider:device-cancel`` URL
+(``/o/device-cancel/<client_id>/<user_code>``). Cancellation is idempotent and
+bound to the signed-in user: the grant is looked up by ``client_id`` and
+``user_code`` and restricted to that user, so an unknown code or another user's
+grant answers 404 instead of revealing its existence.
+
+Only a grant still in the ``authorization-pending`` state and before its
+deadline becomes ``cancelled``:
+
+* cancelling an already ``cancelled`` grant is a no-op;
+* a grant the user has already approved (``authorized``) or denied (``denied``)
+  keeps its state, so a completed authorization can never be marked cancelled
+  afterwards;
+* once the deadline has passed the grant becomes (or stays) ``expired``.
+
+The confirm and cancel transitions both run as a single conditional database
+update, so the outcome of a user clicking both buttons concurrently is
+deterministic: the first committed decision wins. A device polling the token
+endpoint for a cancelled grant receives the RFC 8628 section 3.5
+``access_denied`` error (the RFC defines no dedicated "cancelled" error) and no
+access token is ever issued. The status page (``device-grant-status``) renders
+the resulting ``Cancelled`` state to the user.
+
 Device polling
 --------------
 Send the following request (in the real world, the device makes this request). In `RFC`_ Figure 1, this is step (E).

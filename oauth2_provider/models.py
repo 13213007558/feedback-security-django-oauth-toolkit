@@ -1505,12 +1505,14 @@ class AbstractDeviceGrant(models.Model):
     AUTHORIZATION_PENDING = "authorization-pending"
     EXPIRED = "expired"
     DENIED = "denied"
+    CANCELLED = "cancelled"
 
     DEVICE_FLOW_STATUS = (
         (AUTHORIZED, _("Authorized")),
         (AUTHORIZATION_PENDING, _("Authorization pending")),
         (EXPIRED, _("Expired")),
         (DENIED, _("Denied")),
+        (CANCELLED, _("Cancelled")),
     )
 
     id = models.BigAutoField(primary_key=True)
@@ -1543,17 +1545,49 @@ class AbstractDeviceGrant(models.Model):
         """
         Check device flow session expiration and set the status to "expired" if current time
         is past the "expires" deadline.
+
+        A grant that has reached a terminal state other than AUTHORIZED (DENIED, CANCELLED)
+        keeps that state: the user's explicit decision must not be silently rewritten to
+        "expired" by a later polling request.
         """
         if self.status == self.EXPIRED:
             return True
 
         now = datetime.now(tz=dt_timezone.utc)
         if now >= self.expires:
-            self.status = self.EXPIRED
-            self.save(update_fields=["status"])
+            if self.status == self.AUTHORIZATION_PENDING or self.status == self.AUTHORIZED:
+                self.status = self.EXPIRED
+                self.save(update_fields=["status"])
             return True
 
         return False
+
+    def cancel(self) -> str:
+        """
+        Cancel a device login that is still waiting for the user's decision, using a single
+        conditional UPDATE so the outcome is well defined when cancellation races with
+        confirmation, expiration handling and token redemption.
+
+        Only a non-expired AUTHORIZATION_PENDING grant transitions to CANCELLED. The method
+        is idempotent:
+
+        * a grant already CANCELLED stays CANCELLED;
+        * AUTHORIZED, DENIED and EXPIRED grants keep their state, so a completed
+          authorization can never be marked cancelled after the fact.
+
+        Returns the grant's status after the attempt.
+        """
+        if self.is_expired():
+            return self.status
+
+        if self.status == self.AUTHORIZATION_PENDING:
+            updated = self.__class__.objects.filter(pk=self.pk, status=self.AUTHORIZATION_PENDING).update(
+                status=self.CANCELLED
+            )
+            if updated:
+                self.status = self.CANCELLED
+
+        return self.status
 
 
 class DeviceGrant(AbstractDeviceGrant):

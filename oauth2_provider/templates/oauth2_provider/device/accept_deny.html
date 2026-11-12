@@ -16,6 +16,10 @@
         <button type="submit" name="action" value="accept">Accept</button>
         <button type="submit" name="action" value="deny">Deny</button>
     </form>
+    <form method="post" action="{% url 'oauth2_provider:device-cancel' client_id=view.kwargs.client_id user_code=view.kwargs.user_code %}">
+        {% csrf_token %}
+        <button type="submit">Cancel</button>
+    </form>
 </body>
 </html>
 {% endblock content %}

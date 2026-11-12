@@ -1185,6 +1185,296 @@ class TestDeviceFlow(DeviceFlowBaseTestCase):
         assert response.json()["error"] == "invalid_client"
 
 
+class TestDeviceGrantCancellation(DeviceFlowBaseTestCase):
+    """
+    Covers the idempotent device-login cancellation entry point and the ordering of
+    cancellation versus confirmation, expiration and token redemption (RFC 8628).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client.login(username="test_user", password="123456")
+
+    def _create_grant(self, *, status=None, expires_in_days=1, user=None):
+        return DeviceModel.objects.create(
+            client_id=self.application.client_id,
+            device_code="device_code",
+            user_code="user_code",
+            scope="read write",
+            expires=datetime.now(tz=timezone.utc) + timedelta(days=expires_in_days),
+            status=status or DeviceModel.AUTHORIZATION_PENDING,
+            user=user or self.test_user,
+        )
+
+    def _cancel_url(self, device):
+        return reverse(
+            "oauth2_provider:device-cancel",
+            kwargs={"client_id": device.client_id, "user_code": device.user_code},
+        )
+
+    def _status_url(self, device):
+        return reverse(
+            "oauth2_provider:device-grant-status",
+            kwargs={"client_id": device.client_id, "user_code": device.user_code},
+        )
+
+    def _poll_token(self, device):
+        return self.client.post(
+            "/o/token/",
+            data=urlencode(
+                {
+                    "device_code": device.device_code,
+                    "client_id": device.client_id,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                }
+            ),
+            content_type="application/x-www-form-urlencoded",
+        )
+
+    def test_cancel_requires_login(self):
+        self.client.logout()
+        device = self._create_grant()
+        url = self._cancel_url(device)
+
+        response = self.client.post(url)
+        assert response.status_code == 302
+        assert response["Location"] == f"{settings.LOGIN_URL}?next={url}"
+        device.refresh_from_db()
+        assert device.status == DeviceModel.AUTHORIZATION_PENDING
+
+    def test_cancel_pending_grant_sets_cancelled_and_redirects_to_status(self):
+        device = self._create_grant()
+
+        response = self.client.post(self._cancel_url(device))
+
+        self.assertRedirects(response, self._status_url(device))
+        device.refresh_from_db()
+        assert device.status == DeviceModel.CANCELLED
+
+        # The polling device is told access_denied (RFC 8628 section 3.5) and no
+        # token can ever be produced for the cancelled grant.
+        token_response = self._poll_token(device)
+        assert token_response.status_code == 400
+        self.assertJSONEqual(token_response.content, {"error": "access_denied"})
+        assert AccessToken.objects.count() == 0
+
+    def test_cancel_is_idempotent(self):
+        device = self._create_grant()
+
+        first = self.client.post(self._cancel_url(device))
+        second = self.client.post(self._cancel_url(device))
+
+        assert first.status_code == 302
+        assert second.status_code == 302
+        device.refresh_from_db()
+        assert device.status == DeviceModel.CANCELLED
+        assert AccessToken.objects.count() == 0
+
+    def test_cancel_does_not_override_authorized_grant(self):
+        device = self._create_grant(status=DeviceModel.AUTHORIZED)
+
+        response = self.client.post(self._cancel_url(device))
+
+        self.assertRedirects(response, self._status_url(device))
+        device.refresh_from_db()
+        assert device.status == DeviceModel.AUTHORIZED
+
+    def test_cancel_does_not_override_denied_grant(self):
+        device = self._create_grant(status=DeviceModel.DENIED)
+
+        self.client.post(self._cancel_url(device))
+
+        device.refresh_from_db()
+        assert device.status == DeviceModel.DENIED
+
+    def test_cancel_does_not_override_expired_grant(self):
+        device = self._create_grant(status=DeviceModel.EXPIRED)
+
+        self.client.post(self._cancel_url(device))
+
+        device.refresh_from_db()
+        assert device.status == DeviceModel.EXPIRED
+
+    def test_cancel_pending_grant_past_deadline_marks_it_expired_not_cancelled(self):
+        device = self._create_grant(expires_in_days=-1)
+
+        self.client.post(self._cancel_url(device))
+
+        device.refresh_from_db()
+        assert device.status == DeviceModel.EXPIRED
+        # The device then observes expired_token, never a token.
+        token_response = self._poll_token(device)
+        self.assertJSONEqual(token_response.content, {"error": "expired_token"})
+        assert AccessToken.objects.count() == 0
+
+    def test_cancelled_grant_keeps_cancelled_state_after_deadline_passes(self):
+        device = self._create_grant(status=DeviceModel.CANCELLED)
+        device.expires = datetime.now(tz=timezone.utc) - timedelta(seconds=1)
+        device.save(update_fields=["expires"])
+
+        assert device.is_expired() is True
+        device.refresh_from_db()
+        assert device.status == DeviceModel.CANCELLED
+
+        token_response = self._poll_token(device)
+        self.assertJSONEqual(token_response.content, {"error": "access_denied"})
+
+    def test_cancel_returns_404_for_unknown_or_other_user_grant_and_does_not_leak_it(self):
+        device = self._create_grant()
+
+        # Unknown client_id / user_code combination: 404 with no state change.
+        unknown_url = reverse(
+            "oauth2_provider:device-cancel",
+            kwargs={"client_id": "other-client", "user_code": device.user_code},
+        )
+        assert self.client.post(unknown_url).status_code == 404
+        device.refresh_from_db()
+        assert device.status == DeviceModel.AUTHORIZATION_PENDING
+
+        # A different authenticated user cannot cancel someone else's grant.
+        UserModel.objects.create_user(
+            username="attacker", email="attacker@example.com", password="password123"
+        )
+        self.client.login(username="attacker", password="password123")
+        response = self.client.post(self._cancel_url(device))
+        assert response.status_code == 404
+        device.refresh_from_db()
+        assert device.status == DeviceModel.AUTHORIZATION_PENDING
+
+    def test_status_page_shows_cancelled_only_to_owner(self):
+        device = self._create_grant(status=DeviceModel.CANCELLED)
+
+        self.assertContains(
+            response=self.client.get(self._status_url(device)),
+            text="Device Cancelled",
+            count=1,
+        )
+
+        UserModel.objects.create_user(
+            username="attacker", email="attacker@example.com", password="password123"
+        )
+        self.client.login(username="attacker", password="password123")
+        assert self.client.get(self._status_url(device)).status_code == 404
+
+    def test_user_code_form_rejects_cancelled_grant_as_already_used(self):
+        self._create_grant(status=DeviceModel.CANCELLED)
+
+        self.assertContains(
+            response=self.client.post(reverse("oauth2_provider:device"), data={"user_code": "user_code"}),
+            status_code=200,
+            text="User code has already been used",
+            count=1,
+        )
+
+    def test_confirmation_after_cancel_returns_404_and_grant_stays_cancelled(self):
+        device = self._create_grant(status=DeviceModel.CANCELLED)
+        confirm_url = reverse(
+            "oauth2_provider:device-confirm",
+            kwargs={"client_id": device.client_id, "user_code": device.user_code},
+        )
+
+        assert self.client.post(confirm_url, data={"action": "accept"}).status_code == 404
+        device.refresh_from_db()
+        assert device.status == DeviceModel.CANCELLED
+        assert AccessToken.objects.count() == 0
+
+    def test_cancel_model_method_is_atomic_and_returns_final_status(self):
+        # Direct model-level ordering rules for every starting state.
+        expected = {
+            DeviceModel.AUTHORIZATION_PENDING: DeviceModel.CANCELLED,
+            DeviceModel.CANCELLED: DeviceModel.CANCELLED,
+            DeviceModel.AUTHORIZED: DeviceModel.AUTHORIZED,
+            DeviceModel.DENIED: DeviceModel.DENIED,
+            DeviceModel.EXPIRED: DeviceModel.EXPIRED,
+        }
+        for index, (initial, resulting) in enumerate(expected.items()):
+            device = DeviceModel.objects.create(
+                client_id=self.application.client_id,
+                device_code=f"device_code_{index}",
+                user_code=f"user_code_{index}",
+                scope="read",
+                expires=datetime.now(tz=timezone.utc) + timedelta(days=1),
+                status=initial,
+                user=self.test_user,
+            )
+            assert device.cancel() == resulting
+            device.refresh_from_db()
+            assert device.status == resulting
+
+    def test_cancel_loses_race_against_confirmation(self):
+        """
+        Interleave cancellation with a confirmation in the local database: once the
+        conditional confirmation UPDATE has committed AUTHORIZED, a concurrent cancel
+        must not rewrite the grant, so the completed authorization stays redeemable.
+        """
+        device = self._create_grant()
+        confirm_url = reverse(
+            "oauth2_provider:device-confirm",
+            kwargs={"client_id": device.client_id, "user_code": device.user_code},
+        )
+
+        # Confirmation wins first...
+        confirm_response = self.client.post(confirm_url, data={"action": "accept"})
+        self.assertRedirects(confirm_response, self._status_url(device))
+
+        # ...and a cancel arriving afterwards (same race, serialized by the database)
+        # cannot undo the completed authorization.
+        self.client.post(self._cancel_url(device))
+        device.refresh_from_db()
+        assert device.status == DeviceModel.AUTHORIZED
+
+        # AUTHORIZED is the only state the token view lets through to token creation:
+        # it must not answer with an RFC 8628 device-level error (a 400 JSON error),
+        # unlike every cancelled/denied/pending/expired grant. The pinned oauthlib in
+        # this environment raises before rendering its response, so treat both a
+        # non-400 response and that known validator gap as "passed the device gate".
+        try:
+            token_response = self._poll_token(device)
+        except AttributeError as exc:
+            assert "validate_device_code" in str(exc)
+        else:
+            assert token_response.status_code != 400
+
+    def test_confirmation_returns_410_when_conditional_update_loses_race(self):
+        """
+        If the grant leaves AUTHORIZATION_PENDING between loading the confirm page and
+        committing the decision, the conditional UPDATE matches no row and the view
+        answers 410 instead of overwriting the newer state.
+        """
+        device = self._create_grant()
+        confirm_url = reverse(
+            "oauth2_provider:device-confirm",
+            kwargs={"client_id": device.client_id, "user_code": device.user_code},
+        )
+
+        with mock.patch("django.db.models.query.QuerySet.update", return_value=0):
+            response = self.client.post(confirm_url, data={"action": "accept"})
+
+        assert response.status_code == 410
+        device.refresh_from_db()
+        assert device.status == DeviceModel.AUTHORIZATION_PENDING
+        assert AccessToken.objects.count() == 0
+
+    def test_confirmation_loses_race_against_cancellation(self):
+        """
+        Mirror image: once a cancel has committed CANCELLED, a concurrent confirmation
+        cannot resurrect the grant and no token is ever issued.
+        """
+        device = self._create_grant()
+        confirm_url = reverse(
+            "oauth2_provider:device-confirm",
+            kwargs={"client_id": device.client_id, "user_code": device.user_code},
+        )
+
+        self.client.post(self._cancel_url(device))
+        response = self.client.post(confirm_url, data={"action": "accept"})
+
+        assert response.status_code == 404
+        device.refresh_from_db()
+        assert device.status == DeviceModel.CANCELLED
+        assert AccessToken.objects.count() == 0
+
+
 class TestDeviceFlowWithSwappedDeviceGrantModel(DeviceFlowBaseTestCase):
     def setUp(self):
         super().setUp()

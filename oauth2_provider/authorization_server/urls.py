@@ -25,6 +25,7 @@ from oauth2_provider.authorization_server.views.base import (
 from oauth2_provider.authorization_server.views.device import (
     DeviceAuthorizationView,
     DeviceConfirmView,
+    DeviceGrantCancelView,
     DeviceGrantStatusView,
     DeviceUserCodeView,
 )
@@ -73,6 +74,11 @@ base_urlpatterns = [
         "device-confirm/<slug:client_id>/<slug:user_code>",
         DeviceConfirmView.as_view(),
         name="device-confirm",
+    ),
+    path(
+        "device-cancel/<slug:client_id>/<slug:user_code>",
+        DeviceGrantCancelView.as_view(),
+        name="device-cancel",
     ),
     path(
         "device-grant-status/<slug:client_id>/<slug:user_code>",

@@ -24,6 +24,7 @@ from ..authorization_server.views.base import AuthorizationView, RevokeTokenView
 from ..authorization_server.views.device import (
     DeviceAuthorizationView,
     DeviceConfirmView,
+    DeviceGrantCancelView,
     DeviceGrantStatusView,
     DeviceUserCodeView,
 )

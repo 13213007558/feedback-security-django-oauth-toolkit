@@ -34,6 +34,7 @@ _LAZY = {
     "DeviceUserCodeView": f"{_VIEWS}.device",
     "DeviceConfirmView": f"{_VIEWS}.device",
     "DeviceGrantStatusView": f"{_VIEWS}.device",
+    "DeviceGrantCancelView": f"{_VIEWS}.device",
     "DynamicClientRegistrationView": _DCR,
     "DynamicClientRegistrationManagementView": _DCR,
 }

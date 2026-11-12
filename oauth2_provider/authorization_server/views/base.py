@@ -1428,7 +1428,11 @@ class TokenView(FormEncodedRequestMixin, AuthorizationServerViewMixin, View):
         # Here we are returning the errors according to
         # https://datatracker.ietf.org/doc/html/rfc8628#section-3.5
         # TODO: "slow_down" error (essentially rate-limiting).
-        if device.status == device.DENIED:
+        # DENIED and CANCELLED are checked before is_expired(): both are explicit
+        # terminal decisions and must keep their meaning even once the deadline passes.
+        # RFC 8628 defines no dedicated "cancelled" error, so a user-cancelled grant
+        # surfaces to the polling device as access_denied.
+        if device.status == device.DENIED or device.status == device.CANCELLED:
             error = rfc8628_errors.AccessDenied()
         elif device.is_expired():
             error = rfc8628_errors.ExpiredTokenError()

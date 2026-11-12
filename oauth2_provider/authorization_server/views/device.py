@@ -208,22 +208,33 @@ class DeviceConfirmView(LoginRequiredMixin, FormView):
 
     def form_valid(self, form):
         """
-        Uses get_object() to retrieves the DeviceGrant object and updates its state
+        Uses get_object() to retrieve the DeviceGrant object and updates its state
         to authorized or denied, based on the user input.
+
+        The update is a single conditional UPDATE on the AUTHORIZATION_PENDING state so
+        that a confirmation racing with a cancellation or expiration cannot resurrect a
+        grant that is no longer pending.
         """
         device = self.get_object()
         action = form.cleaned_data["action"]
 
         if action == "accept":
-            device.status = device.AUTHORIZED
-            device.save(update_fields=["status"])
-            return super().form_valid(form)
+            new_status = device.AUTHORIZED
         elif action == "deny":
-            device.status = device.DENIED
-            device.save(update_fields=["status"])
-            return super().form_valid(form)
+            new_status = device.DENIED
         else:
             return http.HttpResponseBadRequest()
+
+        model = get_device_grant_model()
+        updated = model.objects.filter(pk=device.pk, status=model.AUTHORIZATION_PENDING).update(
+            status=new_status
+        )
+        if not updated:
+            # The grant changed between loading the page and submitting it (cancelled,
+            # expired or already decided): do not overwrite the newer terminal state.
+            return http.HttpResponseGone()
+        device.status = new_status
+        return super().form_valid(form)
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -257,3 +268,43 @@ class DeviceGrantStatusView(LoginRequiredMixin, DetailView):
             user_code=user_code,
             user=self.request.user,
         )
+
+
+class DeviceGrantCancelView(LoginRequiredMixin, View):
+    """
+    Idempotent entry point for the authenticated user to cancel a device login
+    that is still waiting for their decision.
+
+    The grant is looked up by ``client_id`` and ``user_code`` and constrained to
+    the requesting user, mirroring :class:`DeviceConfirmView` and
+    :class:`DeviceGrantStatusView`: a grant belonging to another user (or an
+    unknown code) answers 404 instead of revealing its existence, so no other
+    user's device codes can be probed.
+
+    State ordering is enforced by :meth:`AbstractDeviceGrant.cancel`: only a
+    non-expired AUTHORIZATION_PENDING grant becomes CANCELLED. Confirmation
+    (AUTHORIZED/DENIED), expiration and token redemption all win over a
+    concurrent cancellation, and cancelling an already CANCELLED grant is a
+    no-op, so the endpoint is safe to retry. The device polling the token
+    endpoint then receives ``access_denied`` (RFC 8628 section 3.5).
+    """
+
+    def get_success_url(self):
+        return reverse(
+            "oauth2_provider:device-grant-status",
+            kwargs={
+                "client_id": self.kwargs["client_id"],
+                "user_code": self.kwargs["user_code"],
+            },
+        )
+
+    def post(self, request, *args, **kwargs):
+        model = get_device_grant_model()
+        device = get_object_or_404(
+            model,
+            client_id=kwargs["client_id"],
+            user_code=kwargs["user_code"],
+            user=request.user,
+        )
+        device.cancel()
+        return http.HttpResponseRedirect(self.get_success_url())

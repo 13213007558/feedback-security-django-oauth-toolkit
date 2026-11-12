@@ -260,6 +260,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   swapped Application model, so run `makemigrations` for your app (no data step is needed). The
   demo IdP's login page (`tests/app/idp`) shows them too, for the OpenID certification
   `oidcc-registration-logo-uri`, `-policy-uri` and `-tos-uri` review modules.
+* Idempotent cancellation of a pending device authorization grant (RFC 8628). The new
+  `oauth2_provider:device-cancel` URL (`DeviceGrantCancelView`,
+  `/o/device-cancel/<client_id>/<user_code>`) lets the signed-in user cancel a device login
+  that is still waiting for their decision. The grant lookup is scoped to the requesting user
+  and client, so another user's or an unknown device code answers 404. A new `cancelled`
+  `DeviceGrant.status` (migration `0033`; swapped device-grant models need their own migration)
+  is set only from a non-expired `authorization-pending` grant via a single conditional UPDATE,
+  and `AbstractDeviceGrant.cancel()` is idempotent: already cancelled, authorized, denied or
+  expired grants keep their state. The confirm view now uses the same conditional update, so the
+  first committed decision wins when confirmation and cancellation race. A cancelled grant
+  polls back as `access_denied` (RFC 8628 defines no dedicated cancelled error) and can never
+  produce a token; `is_expired()` no longer rewrites an explicit `denied`/`cancelled` decision
+  to `expired`.
 ### Changed
 * #1928 `REQUEST_APPROVAL_PROMPT = "force"` (the default) and `approval_prompt=force` no longer
   apply to a request with `prompt=none`, which must not show the consent page (OpenID Connect Core
