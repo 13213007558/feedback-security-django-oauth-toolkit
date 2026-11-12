@@ -189,7 +189,9 @@ CLEAR_EXPIRED_TOKENS_BATCH_SIZE
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default: ``10000``
 
-The size of delete batches used by ``cleartokens`` management command.
+The size of delete batches used by ``cleartokens`` management command. Each batch is
+committed and the ``TokenCleanupRun`` checkpoint is updated before the next starts, so this
+also bounds how much work a resumed run repeats after an interruption.
 
 CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -314,9 +316,11 @@ consumed refresh token and the only recourse is to have the user
 re-authenticate. A suggested value, if this is enabled, is 2 minutes. The
 value must not be negative.
 
-The ``cleartokens`` management command removes revoked refresh tokens once the
-grace period has passed, unless ``REFRESH_TOKEN_REUSE_PROTECTION`` is enabled.
-Check :ref:`cleartokens` management command for further info.
+The ``cleartokens`` management command removes revoked refresh tokens once their
+*evidence retention* period has passed. That period is never shorter than the
+grace period, the refresh-token lifetime when ``REFRESH_TOKEN_REUSE_PROTECTION``
+is enabled, or ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS``. Check the
+:ref:`cleartokens` management command for further info.
 
 The grace period only ever shields a refresh token that a rotation *superseded* — the
 token a client retries when it did not receive the rotated response. A refresh token that
@@ -329,6 +333,31 @@ the revocation". The same applies to a token that has already been rotated past 
 With ``ROTATE_REFRESH_TOKEN`` disabled nothing supersedes a refresh token, so the grace
 period has no effect: the same token stays valid until it is revoked or expires.
 
+REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``None``
+
+How long a revoked refresh token is kept after revocation as evidence that a refresh
+token was consumed. With ``REFRESH_TOKEN_REUSE_PROTECTION`` on, that row is what lets
+the ``/token/`` endpoint recognize a replay of a rotated token and revoke its family
+(RFC 9700 §4.14.2); deleting it early silently disables the protection. It is likewise
+needed for the grace period, so a client retrying the immediately preceding token is
+served.
+
+``None`` keeps the pre-existing behavior: retain for the longest of the grace period and,
+when reuse protection is on, the refresh-token lifetime -- indefinitely when
+``REFRESH_TOKEN_EXPIRE_SECONDS`` is unset and reuse protection is on.
+
+With ``REFRESH_TOKEN_REUSE_PROTECTION`` on, an explicit value can only **extend** the
+reuse-detection floor, never shorten it below the refresh-token lifetime: a shorter window
+would silently disable replay detection for tokens that still exist. With reuse protection
+off, a revoked row backs no live security decision, so an explicit value is an ordinary
+retention cap (bounded below by the grace period), suitable for a privacy policy. The value
+must not be negative.
+
+Evidence that outlives an account can be kept in the ``RevokedTokenEvidence`` table through
+``purge_user_credentials()``; see :ref:`cleartokens-account-deletion`.
+
 REFRESH_TOKEN_REUSE_PROTECTION
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When this is set to ``True`` (default ``False``), and ``ROTATE_REFRESH_TOKEN`` is used, the server will check
@@ -338,6 +367,12 @@ A reused refresh token indicates a breach. Since the server can't determine whic
 user and which from an attacker, it will end the session for both. The user is required to perform a new login.
 
 Can be used in combination with ``REFRESH_TOKEN_GRACE_PERIOD_SECONDS``
+
+The revoked rows this reads are retained by ``cleartokens`` for at least the
+refresh-token lifetime; see ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` above and
+:ref:`cleartokens`. A purged account keeps only a checksum, family id and client id in
+``RevokedTokenEvidence`` (see :ref:`cleartokens-account-deletion`), which is enough for a
+replay of a purged token to revoke the same family.
 
 The family is revoked as a set, by ``RefreshToken.revoke_family()``, in a fixed number of
 queries however large the family is. This matters because a rotating session keeps every

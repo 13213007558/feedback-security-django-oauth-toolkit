@@ -116,6 +116,10 @@ DEFAULTS = {
     "ACCESS_TOKEN_EXPIRE_SECONDS": 36000,
     "REFRESH_TOKEN_EXPIRE_SECONDS": None,
     "REFRESH_TOKEN_GRACE_PERIOD_SECONDS": 0,
+    # How long a revoked refresh token is kept as reuse-detection evidence. ``None`` keeps
+    # 3.x behavior (fall back to REFRESH_TOKEN_EXPIRE_SECONDS; never prune when that is
+    # unset), ``0`` prunes evidence as soon as the grace period allows.
+    "REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS": None,
     "REFRESH_TOKEN_REUSE_PROTECTION": False,
     "ROTATE_REFRESH_TOKEN": True,
     "ERROR_RESPONSE_WITH_SCOPES": False,

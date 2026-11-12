@@ -15,6 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* #1855 `cleartokens`/`clear_expired()` is now a staged, resumable cleanup that keeps
+  revocation evidence for exactly as long as a security decision needs it. The sweep runs in
+  ordered phases (expired grants, stored authorization requests, orphaned refresh tokens,
+  idle-expired refresh tokens, revoked refresh tokens, expired access/ID tokens, expired
+  evidence) and checkpoints progress in a new `TokenCleanupRun` row after every batch, so an
+  interrupted run continues with `cleartokens --resume` instead of starting over; every phase
+  is an idempotent deletion guarded by the same cutoff, so restarting reaches the same state
+  and never resurrects a deleted credential. Revoked refresh tokens are retained for at
+  least `REFRESH_TOKEN_GRACE_PERIOD_SECONDS`; with `REFRESH_TOKEN_REUSE_PROTECTION` on
+  they are reuse-detection evidence, so they are kept for `REFRESH_TOKEN_EXPIRE_SECONDS`
+  too (indefinitely when it is unset). The new `REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`
+  (default `None` = existing behavior) lengthens that floor when reuse protection is on,
+  and acts as an ordinary retention cap -- bounded below by the grace period -- when it is
+  off, so a privacy policy can bound how long revoked rows are held. The command reports
+  only counts, phase names and the run id -- `--format=json` emits that for monitoring.
+  New `oauth2_provider.models.purge_user_credentials(user)` deletes all of a user's
+  credentials and, when reuse protection is on, first copies revoked refresh tokens still
+  inside their retention period into the new `RevokedTokenEvidence` table as {SHA-256
+  checksum, token family, client id, revoked_at, retain_until}: no raw token, user
+  reference, scope or application FK. A replay of a purged token is still rejected by
+  `validate_refresh_token` and, with reuse protection, revokes the same family. Migration
+  `0033`.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

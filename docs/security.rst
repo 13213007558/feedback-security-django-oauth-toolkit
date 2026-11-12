@@ -203,6 +203,28 @@ without rotation, echoes back whichever token the request presented.
    ``REFRESH_TOKEN_GRACE_PERIOD_SECONDS = 0`` (the default); ``manage.py check --deploy``
    raises ``oauth2_provider.E001`` otherwise.
 
+Token cleanup and revocation evidence
+--------------------------------------
+
+Scheduled cleanup (``cleartokens``) separates data that can be deleted immediately (expired
+grants, stored authorization requests, orphaned and idle-expired refresh tokens, expired
+access/ID tokens) from revoked refresh tokens that still back a security decision. With
+``REFRESH_TOKEN_REUSE_PROTECTION`` on, those revoked rows are how a replay of a rotated
+token is recognized and its family revoked (see above); the cleanup keeps them for at
+least the refresh-token lifetime, never just the grace period, and
+``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` can only extend that floor. Runs are
+checkpointed and resumable, and restarting mid-sweep cannot make an old credential usable
+again because every deletion is past a cutoff that validation already enforces. See
+:ref:`cleartokens`.
+
+Deleting an account removes its refresh tokens by cascade, including the revoked rows the
+replay judgment needs. Call ``purge_user_credentials()`` first: it deletes every credential
+and, with reuse protection on, keeps only a non-credential ``RevokedTokenEvidence`` row
+(checksum, family id, client id, retention deadline) for revoked tokens still inside their
+retention period. A replayed purged token is rejected and still takes its family down. With
+reuse protection off no evidence is kept, because no live decision reads it. See
+:ref:`cleartokens-account-deletion`.
+
 Out of scope
 ------------
 

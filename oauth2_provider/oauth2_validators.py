@@ -44,12 +44,14 @@ from .models import (
     AbstractApplication,
     AbstractIDToken,
     AbstractRefreshToken,
+    RevokedTokenEvidence,
     get_access_token_model,
     get_application_model,
     get_grant_model,
     get_id_token_model,
     get_refresh_token_model,
     refresh_token_expire_timedelta,
+    refresh_token_grace_period_timedelta,
     revoke_access_token,
     set_token_value,
 )
@@ -1109,12 +1111,25 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         rt = RefreshToken.objects.filter(token_checksum=token_checksum).select_related("access_token").first()
 
         if not rt:
+            # The row may be gone because the account was deleted and only non-credential
+            # evidence was kept (see ``purge_user_credentials``). A replay of such a
+            # purged token is still an attack signal: if evidence exists, take the family
+            # down exactly as a replay against a live row would. This also keeps a token
+            # that was rotated *before* the account deletion from being honored after it.
+            evidence = RevokedTokenEvidence.objects.filter(token_checksum=token_checksum).first()
+            if (
+                evidence is not None
+                and oauth2_settings.REFRESH_TOKEN_REUSE_PROTECTION
+                and evidence.token_family
+            ):
+                RefreshToken.revoke_family(evidence.token_family)
             return False
 
         if rt.revoked is not None:
-            grace_expired = rt.revoked <= timezone.now() - timedelta(
-                seconds=oauth2_settings.REFRESH_TOKEN_GRACE_PERIOD_SECONDS
-            )
+            # Shared with the cleanup sweep so both read REFRESH_TOKEN_GRACE_PERIOD_SECONDS
+            # the same way (and reject a misconfiguration identically).
+            grace_period = refresh_token_grace_period_timedelta()
+            grace_expired = rt.revoked <= timezone.now() - grace_period
             # The grace window exists only to shield the *immediately preceding* refresh
             # token -- a client that retried because it did not receive the rotated
             # response. Rotation records that supersession in the same ``revoked`` column

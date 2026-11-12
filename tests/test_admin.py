@@ -21,7 +21,9 @@ from oauth2_provider.authorization_server.admin import (
     GrantAdmin,
     IDTokenAdmin,
     RefreshTokenAdmin,
+    RevokedTokenEvidenceAdmin,
     StoredAuthorizationRequestAdmin,
+    TokenCleanupRunAdmin,
     mask_credential,
 )
 from oauth2_provider.models import (
@@ -30,7 +32,9 @@ from oauth2_provider.models import (
     get_grant_model,
     get_id_token_model,
     get_refresh_token_model,
+    get_revoked_token_evidence_model,
     get_stored_authorization_request_model,
+    get_token_cleanup_run_model,
 )
 
 
@@ -90,6 +94,29 @@ def _assert_hidden_on_change_form(admin_class, model, field, masked_field):
     assert getattr(model_admin, masked_field)(None) == ""
     # Adding credentials via the admin is disabled; they are issued by the OAuth flows.
     assert model_admin.has_add_permission(request) is False
+
+
+def test_cleanup_state_admins_are_read_only():
+    """Evidence and run bookkeeping are written by the toolkit, never hand-edited."""
+    request = RequestFactory().get("/")
+    for admin_class, model in (
+        (RevokedTokenEvidenceAdmin, get_revoked_token_evidence_model()),
+        (TokenCleanupRunAdmin, get_token_cleanup_run_model()),
+    ):
+        model_admin = admin_class(model, AdminSite())
+        assert model_admin.has_add_permission(request) is False
+        assert model_admin.has_change_permission(request, obj=model()) is False
+
+
+def test_evidence_admin_does_not_expose_checksum():
+    # The checksum correlates a purged token with a session, so it is not listed or searchable.
+    assert "token_checksum" not in RevokedTokenEvidenceAdmin.list_display
+    assert RevokedTokenEvidenceAdmin.search_fields == ()
+
+
+def test_cleanup_run_admin_exposes_only_counts_and_phase_state():
+    assert "counts" in TokenCleanupRunAdmin.readonly_fields
+    assert "completed_phases" in TokenCleanupRunAdmin.readonly_fields
 
 
 def test_credential_admins_disable_add():

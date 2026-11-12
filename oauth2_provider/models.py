@@ -1392,6 +1392,105 @@ class RefreshToken(AbstractRefreshToken):
         swappable = "OAUTH2_PROVIDER_REFRESH_TOKEN_MODEL"
 
 
+class RevokedTokenEvidence(models.Model):
+    """Non-credential evidence that a refresh token was revoked.
+
+    A revoked refresh token has to exist as a row for
+    ``REFRESH_TOKEN_REUSE_PROTECTION`` to recognize a replay and revoke the family it
+    belongs to. A deleted account carries all of its refresh token rows away with it
+    (``RefreshToken.user`` is ``CASCADE``), so :func:`purge_user_credentials` copies the
+    minimum needed to keep that judgment possible into this table first -- only when an
+    explicit ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` policy asks for it.
+
+    What is stored is deliberately not a credential:
+
+    * ``token_checksum`` is the SHA-256 of the token value. It recognizes a replay but,
+      for a high-entropy token, cannot be reversed into a usable token.
+    * ``token_family`` and ``client_id`` are identifiers the reuse sweep needs. Neither is
+      secret.
+    * ``revoked_at`` and ``retain_until`` say when the evidence stops being needed.
+      ``retain_until`` is ``NULL`` when the evidence must be kept indefinitely (reuse
+      protection on, refresh tokens never age-expire, and no explicit retention policy).
+
+    There is no user reference, no raw token value, no scope, and no foreign key to the
+    application (the application may itself be deleted with the account). The row cannot
+    be exchanged for an access token and does not make anything usable; it only outlives
+    the credential it describes. ``clear_expired`` prunes rows past ``retain_until`` on
+    the same schedule as the other expired data.
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    token_checksum = models.CharField(
+        max_length=64, unique=True, db_index=True, verbose_name=_("token checksum")
+    )
+    token_family = models.UUIDField(null=True, blank=True, verbose_name=_("token family"))
+    client_id = models.CharField(max_length=255, blank=True, default="", verbose_name=_("client ID"))
+    revoked_at = models.DateTimeField(verbose_name=_("revoked at"))
+    # Indexed because ``clear_expired`` prunes by this column on every run. ``NULL`` means
+    # "retain indefinitely" and is never matched by the prune query.
+    retain_until = models.DateTimeField(null=True, blank=True, db_index=True, verbose_name=_("retain until"))
+    created = models.DateTimeField(auto_now_add=True, verbose_name=_("created"))
+
+    def __str__(self):
+        # Never render the checksum: __str__ appears in the admin, repr() in tracebacks,
+        # and in log output.
+        return "RevokedTokenEvidence #{self.pk}".format(self=self)
+
+    class Meta:
+        verbose_name = _("revoked token evidence")
+        verbose_name_plural = _("revoked token evidence")
+
+
+class TokenCleanupRun(models.Model):
+    """Bookkeeping for one :func:`clear_expired` invocation.
+
+    ``clear_expired`` deletes in phases and in bounded batches, so an operator can stop it
+    (deploy, timeout, Ctrl-C) and run it again later. This row is what makes that
+    *resumable* rather than merely retryable: it records which phases already finished,
+    which phase was running, and the counts accumulated so far. A restart with
+    ``resume=True`` continues from the interrupted phase; every phase is idempotent, so
+    even a run that starts over from phase one reaches the same state.
+
+    The row holds no credential material -- only phase names, counts and timestamps -- so
+    it is safe to inspect in the admin or expose through monitoring.
+    """
+
+    RUNNING = "running"
+    INTERRUPTED = "interrupted"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    STATUS_CHOICES = (
+        (RUNNING, _("Running")),
+        (INTERRUPTED, _("Interrupted")),
+        (COMPLETED, _("Completed")),
+        (FAILED, _("Failed")),
+    )
+
+    id = models.BigAutoField(primary_key=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=RUNNING, db_index=True)
+    # The phase that was running when the row was last written; for a completed run, the
+    # last phase. Kept as a name, not an index, so reordering PHASES cannot silently
+    # resume at the wrong point.
+    phase = models.CharField(max_length=32, blank=True, default="")
+    completed_phases = models.JSONField(default=list, blank=True)
+    counts = models.JSONField(default=dict, blank=True)
+    batches = models.PositiveIntegerField(default=0)
+    cutoffs = models.JSONField(default=dict, blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return "TokenCleanupRun #{self.pk}".format(self=self)
+
+    class Meta:
+        verbose_name = _("token cleanup run")
+        verbose_name_plural = _("token cleanup runs")
+        indexes = [
+            # ``clear_expired(resume=True)`` finds the latest unfinished run by status.
+            models.Index(fields=["status", "-id"]),
+        ]
+
+
 class AbstractIDToken(models.Model):
     """
     An IDToken instance represents the token used to authenticate the user and
@@ -1698,6 +1797,20 @@ def get_refresh_token_model():
     return apps.get_model(oauth2_settings.REFRESH_TOKEN_MODEL)
 
 
+def get_revoked_token_evidence_model():
+    """Return the model that stores non-credential revocation evidence.
+
+    It is not swappable: it holds no relation to a project's user or application models,
+    only a checksum and identifiers, so a swapped token model does not need to replace it.
+    """
+    return RevokedTokenEvidence
+
+
+def get_token_cleanup_run_model():
+    """Return the model that records ``clear_expired`` run checkpoints."""
+    return TokenCleanupRun
+
+
 def get_application_admin_class():
     """Return the Application admin class that is active in this project."""
     application_admin_class = oauth2_settings.APPLICATION_ADMIN_CLASS
@@ -1750,6 +1863,127 @@ def refresh_token_expire_timedelta():
     return value
 
 
+def refresh_token_evidence_retention_timedelta() -> timedelta | None:
+    """Return ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` as a ``timedelta``.
+
+    ``None`` (the default) keeps the pre-existing behaviour: reuse-detection evidence is
+    retained for as long as the protections that are enabled require. An explicit value
+    adds a *minimum* retention period on top of the grace period, and on top of the
+    refresh-token lifetime when ``REFRESH_TOKEN_REUSE_PROTECTION`` is on. ``0`` adds
+    nothing beyond the protections' own requirements.
+
+    Raises ``ImproperlyConfigured`` for a non-numeric, out-of-range, or negative value,
+    like :func:`refresh_token_expire_timedelta`, so a misconfiguration fails identically
+    at validation time and in ``clear_expired``.
+    """
+    value = oauth2_settings.REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS
+    if value is None:
+        return None
+    if not isinstance(value, timedelta):
+        try:
+            value = timedelta(seconds=value)
+        except (TypeError, OverflowError):
+            raise ImproperlyConfigured(
+                "REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS must be either a timedelta or seconds"
+            )
+    if value < timedelta(0):
+        raise ImproperlyConfigured("REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS must not be negative")
+    return value
+
+
+def refresh_token_grace_period_timedelta() -> timedelta:
+    """Return ``REFRESH_TOKEN_GRACE_PERIOD_SECONDS`` as a non-negative ``timedelta``.
+
+    Shared by validation and cleanup so both interpret the window the same way and an
+    invalid value fails the same way (``ImproperlyConfigured``).
+    """
+    value = oauth2_settings.REFRESH_TOKEN_GRACE_PERIOD_SECONDS
+    if not value:
+        return timedelta(0)
+    if not isinstance(value, timedelta):
+        try:
+            value = timedelta(seconds=value)
+        except (TypeError, OverflowError):
+            raise ImproperlyConfigured("REFRESH_TOKEN_GRACE_PERIOD_SECONDS must be in seconds")
+    if value < timedelta(0):
+        raise ImproperlyConfigured("REFRESH_TOKEN_GRACE_PERIOD_SECONDS must not be negative")
+    return value
+
+
+def revoked_refresh_token_retention() -> timedelta | None:
+    """Return how long a revoked refresh token must be kept after revocation.
+
+    ``None`` means "keep forever". What is required depends on what the setting is
+    protecting:
+
+    * the **grace period** is always required -- a rotation that superseded a token must
+      still be recognizable so a retry within the window can be served. It is therefore
+      the floor, regardless of what ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` says.
+    * when ``REFRESH_TOKEN_REUSE_PROTECTION`` is on, the revoked row is *reuse-detection
+      evidence*. It is required for ``REFRESH_TOKEN_EXPIRE_SECONDS``, and an explicit
+      ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` can extend that (never shorten it below
+      the refresh-token lifetime).
+    * when reuse protection is off, a revoked row is not evidence for any live security
+      decision. ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` is then an ordinary
+      *retention cap* chosen by the operator's privacy policy, limited below only by the
+      grace period. ``None`` means "fall back to the old schedule: just the grace period".
+
+    The return value is a duration; the caller compares ``revoked <= now - retention``.
+    """
+    grace = refresh_token_grace_period_timedelta()
+    retention = refresh_token_evidence_retention_timedelta()
+    expire = refresh_token_expire_timedelta()
+    if oauth2_settings.REFRESH_TOKEN_REUSE_PROTECTION:
+        if expire is None and retention is None:
+            return None
+        keep = max(grace, expire) if expire is not None else grace
+        if retention is not None:
+            keep = max(keep, retention)
+        return keep
+    if retention is None:
+        return grace
+    return max(grace, retention)
+
+
+def revocation_evidence_required() -> bool:
+    """Whether a revoked refresh token backs a security decision worth preserving.
+
+    Only reuse protection consumes revoked refresh-token rows as evidence. When it is off,
+    a deleted revoked token cannot make anything usable: the token is unknown and is
+    rejected as ``invalid_grant``. Keeping evidence for deleted accounts in that mode
+    would retain personal data for no security benefit.
+    """
+    return bool(oauth2_settings.REFRESH_TOKEN_REUSE_PROTECTION)
+
+
+@dataclass(frozen=True)
+class TokenCleanupReport:
+    """Outcome of :func:`clear_expired`, suitable for logs and cron output.
+
+    It deliberately carries only counts, phase names and the cleanup run identifier. It
+    never contains token values, token checksums, user identifiers or other credential
+    material: a cleanup report is often shipped to a log aggregator.
+    """
+
+    run_id: int
+    status: str
+    phase: str
+    counts: dict[str, int]
+    batches: int
+    cutoffs: dict[str, str | None]
+
+    def as_dict(self) -> dict:
+        """Return the report as JSON-serializable data (counts and non-sensitive ids)."""
+        return {
+            "run_id": self.run_id,
+            "status": self.status,
+            "phase": self.phase,
+            "batches": self.batches,
+            "counts": dict(self.counts),
+            "cutoffs": dict(self.cutoffs),
+        }
+
+
 def revoke_access_token(access_token: AbstractAccessToken) -> None:
     """
     Revoke an access token and, if present, its bound refresh token.
@@ -1776,122 +2010,391 @@ def revoke_access_token(access_token: AbstractAccessToken) -> None:
         access_token.revoke()
 
 
-def clear_expired():
-    def batch_delete(queryset, query):
-        CLEAR_EXPIRED_TOKENS_BATCH_SIZE = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_SIZE
-        CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL
-        current_no = start_no = queryset.count()
+CLEANUP_PHASE_EXPIRED_GRANTS = "expired_grants"
+CLEANUP_PHASE_EXPIRED_STORED_REQUESTS = "expired_stored_authorization_requests"
+CLEANUP_PHASE_ORPHANED_REFRESH_TOKENS = "orphaned_refresh_tokens"
+CLEANUP_PHASE_EXPIRED_REFRESH_TOKENS = "expired_refresh_tokens"
+CLEANUP_PHASE_REVOKED_REFRESH_TOKENS = "revoked_refresh_tokens"
+CLEANUP_PHASE_EXPIRED_ACCESS_TOKENS = "expired_access_tokens"
+CLEANUP_PHASE_EXPIRED_ID_TOKENS = "expired_id_tokens"
+CLEANUP_PHASE_EXPIRED_REVOCATION_EVIDENCE = "expired_revocation_evidence"
 
-        while current_no:
-            flat_queryset = queryset.values_list("pk", flat=True)[:CLEAR_EXPIRED_TOKENS_BATCH_SIZE]
-            batch_length = flat_queryset.count()
-            queryset.model.objects.filter(pk__in=list(flat_queryset)).delete()
-            logger.debug(f"{batch_length} tokens deleted, {current_no - batch_length} left")
-            queryset = queryset.model.objects.filter(query)
-            time.sleep(CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL)
-            current_no = queryset.count()
+# Ordered so that a single sweep reclaims as much as possible: rows that become
+# deletable only once another row is gone (a refresh token whose access token then has no
+# refresh token left) come after the phase that releases them. Every phase is idempotent,
+# so a resumed run simply re-evaluates its query.
+CLEANUP_PHASES = (
+    CLEANUP_PHASE_EXPIRED_GRANTS,
+    CLEANUP_PHASE_EXPIRED_STORED_REQUESTS,
+    CLEANUP_PHASE_ORPHANED_REFRESH_TOKENS,
+    CLEANUP_PHASE_EXPIRED_REFRESH_TOKENS,
+    CLEANUP_PHASE_REVOKED_REFRESH_TOKENS,
+    CLEANUP_PHASE_EXPIRED_ACCESS_TOKENS,
+    CLEANUP_PHASE_EXPIRED_ID_TOKENS,
+    CLEANUP_PHASE_EXPIRED_REVOCATION_EVIDENCE,
+)
 
-        stop_no = queryset.model.objects.filter(query).count()
-        deleted = start_no - stop_no
-        return deleted
 
+def _delete_cleanup_batch(model, query, run, phase, counts, batch_size, batch_interval):
+    """Delete up to ``batch_size`` matching rows, checkpointing after each batch.
+
+    Returns ``(deleted_rows, batch_count)``. Only primary keys are ever selected, so the
+    function never materializes token values or checksums in memory or in the run row.
+    Checkpointing after each batch is what makes an interrupted run resumable with
+    accurate counts: the rows already deleted are recorded before the next batch starts.
+    """
+    pks = list(model._default_manager.filter(query).values_list("pk", flat=True)[:batch_size])
+    if not pks:
+        return 0, 0
+    model._default_manager.filter(pk__in=pks).delete()
+    deleted = len(pks)
+    counts[phase] = counts.get(phase, 0) + deleted
+    run.counts = counts
+    run.batches = (run.batches or 0) + 1
+    run.save(update_fields=["counts", "batches", "updated_at"])
+    if batch_interval:
+        time.sleep(batch_interval)
+    return deleted, 1
+
+
+def _run_cleanup_phase(model, query, run, phase, counts, batch_size, batch_interval):
+    """Drain one phase in bounded batches, returning the total number of rows deleted."""
+    total = 0
+    batch_count = 0
+    while True:
+        deleted, batches = _delete_cleanup_batch(model, query, run, phase, counts, batch_size, batch_interval)
+        if not deleted:
+            break
+        total += deleted
+        batch_count += batches
+    return total, batch_count
+
+
+def clear_expired(*, resume: bool = False) -> TokenCleanupReport:
+    """Delete token data that is no longer needed, in resumable phases.
+
+    The sweep separates three kinds of data:
+
+    * **Immediately deletable** -- expired grants, expired stored authorization requests,
+      orphaned refresh tokens (no access token left to refresh against), idle-expired
+      refresh tokens (only when ``REFRESH_TOKEN_EXPIRE_SECONDS`` is set), and expired
+      access/ID tokens. None of these participate in a security decision any more;
+      deleting them cannot make a revoked credential usable again.
+    * **Still needed for reuse detection** -- revoked refresh tokens younger than the
+      retention floor computed by :func:`revoked_refresh_token_retention`. With
+      ``REFRESH_TOKEN_REUSE_PROTECTION`` on, these rows are exactly what lets a replay of
+      a rotated token be recognized and its family revoked, so they are never deleted
+      early. The retention is the longer of the grace period and, when reuse
+      protection is on, the refresh-token lifetime -- optionally extended by an explicit
+      ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS``.
+    * **Past the evidence retention period** -- revoked refresh tokens older than that
+      floor, and :class:`RevokedTokenEvidence` rows whose ``retain_until`` has passed.
+
+    The run is checkpointed in :class:`TokenCleanupRun` after every batch. If it is
+    interrupted and restarted with ``resume=True``, it continues at the phase it was in;
+    because every phase is a pure deletion guarded by the same cutoff, restarting from
+    any point converges on the same state and never resurrects a deleted credential.
+    Without ``resume`` a fresh run starts and any unfinished run is marked interrupted.
+
+    Returns a :class:`TokenCleanupReport` containing only counts, phase names and the
+    run id -- never a token value, checksum or user identifier.
+    """
     now = timezone.now()
-    refresh_revoked_at = now
-    refresh_expire_at = None
     access_token_model = get_access_token_model()
     refresh_token_model = get_refresh_token_model()
     id_token_model = get_id_token_model()
     grant_model = get_grant_model()
-    REFRESH_TOKEN_GRACE_PERIOD_SECONDS = oauth2_settings.REFRESH_TOKEN_GRACE_PERIOD_SECONDS
-
-    if REFRESH_TOKEN_GRACE_PERIOD_SECONDS:
-        try:
-            REFRESH_TOKEN_GRACE_PERIOD_SECONDS = timedelta(seconds=REFRESH_TOKEN_GRACE_PERIOD_SECONDS)
-        except TypeError:
-            e = "REFRESH_TOKEN_GRACE_PERIOD_SECONDS must be in seconds"
-            raise ImproperlyConfigured(e)
-        if REFRESH_TOKEN_GRACE_PERIOD_SECONDS < timedelta(0):
-            e = "REFRESH_TOKEN_GRACE_PERIOD_SECONDS must not be negative"
-            raise ImproperlyConfigured(e)
-        refresh_revoked_at = now - REFRESH_TOKEN_GRACE_PERIOD_SECONDS
-
-    refresh_token_expire_delta = refresh_token_expire_timedelta()
-    if refresh_token_expire_delta:
-        refresh_expire_at = now - refresh_token_expire_delta
-
-    if oauth2_settings.REFRESH_TOKEN_REUSE_PROTECTION:
-        # Revoked refresh tokens are what allows reuse of a rotated token to
-        # be detected and the token family revoked, so they must be kept
-        # until they expire.
-        refresh_revoked_at = refresh_expire_at
-
-    if refresh_revoked_at:
-        revoked_query = models.Q(revoked__lte=refresh_revoked_at)
-        revoked = refresh_token_model.objects.filter(revoked_query)
-
-        revoked_deleted_no = batch_delete(revoked, revoked_query)
-        logger.info("%s Revoked refresh tokens deleted", revoked_deleted_no)
-    else:
-        logger.info("refresh_revoked_at is %s. No revoked refresh tokens deleted.", refresh_revoked_at)
-
-    # Orphaned refresh tokens: non-revoked, but their access token is gone
-    # (``RefreshToken.access_token`` is SET_NULL, so deleting an access token out of band
-    # leaves the refresh token behind with a NULL FK). The toolkit no longer produces
-    # these -- both the RFC 7009 ``/revoke/`` endpoint and the admin view revoke the bound
-    # refresh token when an access token is revoked -- so any that remain came from an
-    # out-of-band deletion and are stale. Delete them regardless of
-    # REFRESH_TOKEN_EXPIRE_SECONDS: there is no access token to anchor an expiry on, and a
-    # surviving orphan could re-mint access tokens, defeating whatever removed the access
-    # token in the first place. This is also the case that could previously live in the DB
-    # forever, because the age join below can never match a NULL access token (#746).
-    orphan_query = models.Q(revoked__isnull=True, access_token__isnull=True)
-    orphans = refresh_token_model.objects.filter(orphan_query)
-
-    orphans_deleted_no = batch_delete(orphans, orphan_query)
-    logger.info("%s Orphaned refresh tokens deleted", orphans_deleted_no)
-
-    if refresh_expire_at:
-        # Idle expiry: a refresh token is reclaimed REFRESH_TOKEN_EXPIRE_SECONDS after its
-        # paired access token expires. ``access_token.expires`` advances on every refresh,
-        # so an actively-used token slides forward and only dormant ones are reaped. Orphans
-        # (NULL access token) are handled above; this join deliberately ignores them.
-        # ``__lte`` so a token whose access token expired exactly at the cutoff is reclaimed,
-        # matching AccessToken.is_expired() (``now >= expires``) and validation-time expiry.
-        expired_query = models.Q(revoked__isnull=True, access_token__expires__lte=refresh_expire_at)
-        expired = refresh_token_model.objects.filter(expired_query)
-
-        expired_deleted_no = batch_delete(expired, expired_query)
-        logger.info("%s Expired refresh tokens deleted", expired_deleted_no)
-    else:
-        logger.info("refresh_expire_at is %s. No expired refresh tokens deleted.", refresh_expire_at)
-
-    access_token_query = models.Q(refresh_token__isnull=True, expires__lt=now)
-    access_tokens = access_token_model.objects.filter(access_token_query)
-
-    access_tokens_delete_no = batch_delete(access_tokens, access_token_query)
-    logger.info("%s Expired access tokens deleted", access_tokens_delete_no)
-
-    id_token_query = models.Q(access_token__isnull=True, expires__lt=now)
-    id_tokens = id_token_model.objects.filter(id_token_query)
-
-    id_tokens_delete_no = batch_delete(id_tokens, id_token_query)
-    logger.info("%s Expired ID tokens deleted", id_tokens_delete_no)
-
-    grants_query = models.Q(expires__lt=now)
-    grants = grant_model.objects.filter(grants_query)
-
-    grants_deleted_no = batch_delete(grants, grants_query)
-    logger.info("%s Expired grant tokens deleted", grants_deleted_no)
-
-    # Stored authorization requests (e.g. RFC 9126 pushed requests) are consumed
-    # one-time at the authorization endpoint, but a request_uri that is never
-    # redeemed would otherwise linger past its expiry, so reap expired rows here too.
     stored_request_model = get_stored_authorization_request_model()
-    stored_request_query = models.Q(expires__lt=now)
-    stored_requests = stored_request_model.objects.filter(stored_request_query)
 
-    stored_requests_deleted_no = batch_delete(stored_requests, stored_request_query)
-    logger.info("%s Expired stored authorization requests deleted", stored_requests_deleted_no)
+    # Validate every retention input up front: a misconfiguration must fail before any
+    # row is deleted, not halfway through the sweep. The grace and evidence values are
+    # read inside ``revoked_refresh_token_retention``; calling the helpers here only
+    # surfaces a bad type/negative value before the first delete.
+    refresh_token_grace_period_timedelta()
+    expire = refresh_token_expire_timedelta()
+    refresh_token_evidence_retention_timedelta()
+    revoked_retention = revoked_refresh_token_retention()
+
+    refresh_expire_at = now - expire if expire is not None else None
+    revoked_retention_at = now - revoked_retention if revoked_retention is not None else None
+
+    batch_size = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_SIZE
+    batch_interval = oauth2_settings.CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL
+
+    if resume:
+        run = (
+            TokenCleanupRun.objects.filter(status__in=[TokenCleanupRun.RUNNING, TokenCleanupRun.INTERRUPTED])
+            .order_by("-id")
+            .first()
+        )
+    else:
+        # A crashed process can leave a RUNNING row behind. Starting fresh supersedes it
+        # rather than silently resuming a run the operator did not ask to continue.
+        TokenCleanupRun.objects.filter(
+            status__in=[TokenCleanupRun.RUNNING, TokenCleanupRun.INTERRUPTED]
+        ).update(status=TokenCleanupRun.INTERRUPTED)
+        run = None
+
+    if run is None:
+        run = TokenCleanupRun.objects.create(
+            status=TokenCleanupRun.RUNNING,
+            counts={},
+            cutoffs={
+                "refresh_expire_at": refresh_expire_at.isoformat() if refresh_expire_at else None,
+                "revoked_retention_at": revoked_retention_at.isoformat() if revoked_retention_at else None,
+                "now": now.isoformat(),
+            },
+        )
+
+    counts = dict(run.counts or {})
+    completed = set(run.completed_phases or [])
+    phase = run.phase or CLEANUP_PHASES[0]
+    # Resume at the recorded phase if the restarted retention inputs still identify the
+    # same cutoff. If the operator changed settings between runs, a phase that has not
+    # completed is re-evaluated with the new cutoff on the same data, which is safe but
+    # the stored finished-phase counts from the old policy are no longer meaningful.
+    if phase not in CLEANUP_PHASES:
+        phase = CLEANUP_PHASES[0]
+
+    def finish(phase_name):
+        completed.add(phase_name)
+        run.completed_phases = sorted(completed)
+        run.phase = phase_name
+        run.status = TokenCleanupRun.RUNNING
+        run.save(update_fields=["completed_phases", "phase", "status", "updated_at"])
+
+    def run_phase(phase_name, model, query):
+        # Phases that already finished in this run are not repeated. A phase that was
+        # interrupted mid-way has partial counts stored from the batches it completed;
+        # re-running its query only removes rows that still match, so no double count
+        # of already-deleted rows can occur.
+        if phase_name in completed:
+            return 0
+        if phase_name not in counts:
+            counts[phase_name] = 0
+        run.phase = phase_name
+        run.save(update_fields=["phase", "updated_at"])
+        deleted, _ = _run_cleanup_phase(model, query, run, phase_name, counts, batch_size, batch_interval)
+        finish(phase_name)
+        logger.info("%s rows deleted in cleanup phase %s", deleted, phase_name)
+        return deleted
+
+    def phase_expired_grants():
+        return run_phase(CLEANUP_PHASE_EXPIRED_GRANTS, grant_model, models.Q(expires__lt=now))
+
+    def phase_expired_stored_requests():
+        return run_phase(
+            CLEANUP_PHASE_EXPIRED_STORED_REQUESTS,
+            stored_request_model,
+            models.Q(expires__lt=now),
+        )
+
+    def phase_orphaned_refresh_tokens():
+        # A non-revoked refresh token with no access token can never be refreshed and can
+        # not participate in reuse detection (nothing was rotated past it), so it is safe
+        # to delete regardless of REFRESH_TOKEN_EXPIRE_SECONDS (#746).
+        return run_phase(
+            CLEANUP_PHASE_ORPHANED_REFRESH_TOKENS,
+            refresh_token_model,
+            models.Q(revoked__isnull=True, access_token__isnull=True),
+        )
+
+    def phase_expired_refresh_tokens():
+        if refresh_expire_at is None:
+            logger.info("refresh_expire_at is None. No expired refresh tokens deleted.")
+            finish(CLEANUP_PHASE_EXPIRED_REFRESH_TOKENS)
+            return 0
+        # ``__lte`` so a token whose access token expired exactly at the cutoff is
+        # reclaimed, matching AccessToken.is_expired() (``now >= expires``).
+        return run_phase(
+            CLEANUP_PHASE_EXPIRED_REFRESH_TOKENS,
+            refresh_token_model,
+            models.Q(revoked__isnull=True, access_token__expires__lte=refresh_expire_at),
+        )
+
+    def phase_revoked_refresh_tokens():
+        if revoked_retention_at is None:
+            logger.info(
+                "revoked refresh token evidence is retained indefinitely; no revoked "
+                "refresh tokens deleted."
+            )
+            finish(CLEANUP_PHASE_REVOKED_REFRESH_TOKENS)
+            return 0
+        return run_phase(
+            CLEANUP_PHASE_REVOKED_REFRESH_TOKENS,
+            refresh_token_model,
+            models.Q(revoked__lte=revoked_retention_at),
+        )
+
+    def phase_expired_access_tokens():
+        return run_phase(
+            CLEANUP_PHASE_EXPIRED_ACCESS_TOKENS,
+            access_token_model,
+            models.Q(refresh_token__isnull=True, expires__lt=now),
+        )
+
+    def phase_expired_id_tokens():
+        return run_phase(
+            CLEANUP_PHASE_EXPIRED_ID_TOKENS,
+            id_token_model,
+            models.Q(access_token__isnull=True, expires__lt=now),
+        )
+
+    def phase_expired_revocation_evidence():
+        # ``retain_until`` NULL means "retain forever", so it is never matched here.
+        return run_phase(
+            CLEANUP_PHASE_EXPIRED_REVOCATION_EVIDENCE,
+            RevokedTokenEvidence,
+            models.Q(retain_until__lte=now),
+        )
+
+    phase_functions = {
+        CLEANUP_PHASE_EXPIRED_GRANTS: phase_expired_grants,
+        CLEANUP_PHASE_EXPIRED_STORED_REQUESTS: phase_expired_stored_requests,
+        CLEANUP_PHASE_ORPHANED_REFRESH_TOKENS: phase_orphaned_refresh_tokens,
+        CLEANUP_PHASE_EXPIRED_REFRESH_TOKENS: phase_expired_refresh_tokens,
+        CLEANUP_PHASE_REVOKED_REFRESH_TOKENS: phase_revoked_refresh_tokens,
+        CLEANUP_PHASE_EXPIRED_ACCESS_TOKENS: phase_expired_access_tokens,
+        CLEANUP_PHASE_EXPIRED_ID_TOKENS: phase_expired_id_tokens,
+        CLEANUP_PHASE_EXPIRED_REVOCATION_EVIDENCE: phase_expired_revocation_evidence,
+    }
+
+    # Resume in phase order but never skip a phase the interrupted run never finished. The
+    # recorded phase may itself be complete (the interruption landed after its last batch),
+    # so the pending set is recomputed from ``completed`` and then trimmed at the first
+    # *pending* phase at or after the recorded one.
+    remaining = [name for name in CLEANUP_PHASES if name not in completed]
+    if phase in CLEANUP_PHASES:
+        start_index = CLEANUP_PHASES.index(phase)
+        resumed = [name for name in remaining if CLEANUP_PHASES.index(name) >= start_index]
+        if resumed:
+            remaining = resumed
+
+    try:
+        for phase_name in remaining:
+            phase_functions[phase_name]()
+    except (KeyboardInterrupt, SystemExit):
+        # Persist enough state for ``resume=True`` to continue where this stopped. The
+        # rows deleted so far stay deleted; the phases still pending are re-evaluated on
+        # the next run, and their cutoffs are recomputed against the new ``now``.
+        TokenCleanupRun.objects.filter(pk=run.pk).update(status=TokenCleanupRun.INTERRUPTED, phase=run.phase)
+        raise
+    except Exception:
+        TokenCleanupRun.objects.filter(pk=run.pk).update(status=TokenCleanupRun.FAILED, phase=run.phase)
+        raise
+
+    run.refresh_from_db()
+    run.status = TokenCleanupRun.COMPLETED
+    run.phase = CLEANUP_PHASES[-1]
+    run.completed_phases = list(CLEANUP_PHASES)
+    run.save(update_fields=["status", "phase", "completed_phases", "updated_at"])
+
+    report = TokenCleanupReport(
+        run_id=run.pk,
+        status=run.status,
+        phase=run.phase,
+        counts={name: counts.get(name, 0) for name in CLEANUP_PHASES},
+        batches=run.batches,
+        cutoffs=dict(run.cutoffs or {}),
+    )
+    logger.info(
+        "token cleanup run %s completed: %s",
+        report.run_id,
+        ", ".join(f"{name}={report.counts[name]}" for name in CLEANUP_PHASES),
+    )
+    return report
+
+
+def purge_user_credentials(user) -> dict[str, int]:
+    """Delete a user's OAuth credentials while keeping the minimum revocation evidence.
+
+    Call this *before* deleting the Django user (or instead of relying on the ``CASCADE``
+    that deleting the user performs), when reuse-detection evidence has to outlive the
+    account. It implements the coexistence rule the cleanup policy needs:
+
+    * every credential row belonging to the user -- access tokens, refresh tokens, ID
+      tokens, grants and device grants -- is deleted, so no credential remains usable;
+    * for each **revoked** refresh token whose retention period has not passed, one
+      :class:`RevokedTokenEvidence` row is written first -- but only when
+      ``REFRESH_TOKEN_REUSE_PROTECTION`` is on, because that judgment is the only thing
+      that consumes it. The row holds only the token's SHA-256 checksum, its family id,
+      the client id and the retention deadline. It lets a replay of a purged token still
+      be recognized (and its family revoked via
+      :func:`OAuth2Validator.validate_refresh_token`) without keeping a raw token, a user
+      reference, a scope or an application foreign key;
+    * live (non-revoked) refresh tokens need no evidence: once deleted, a replay is an
+      unknown token and is rejected as ``invalid_grant``. Copying them would retain more
+      personal data than the security judgment needs.
+
+    Returns counts keyed by data type (no token values and no user identifiers), so the
+    caller can log an account-deletion result without leaking credential material.
+    """
+    now = timezone.now()
+    access_token_model = get_access_token_model()
+    refresh_token_model = get_refresh_token_model()
+    id_token_model = get_id_token_model()
+    grant_model = get_grant_model()
+    device_grant_model = get_device_grant_model()
+
+    keep_evidence = revocation_evidence_required()
+    retention = revoked_refresh_token_retention()
+    counts = {
+        "revoked_evidence_created": 0,
+        "refresh_tokens_deleted": 0,
+        "access_tokens_deleted": 0,
+        "id_tokens_deleted": 0,
+        "grants_deleted": 0,
+        "device_grants_deleted": 0,
+    }
+
+    revoked_tokens = list(
+        refresh_token_model.objects.filter(user=user, revoked__isnull=False).values(
+            "token_checksum", "token_family", "revoked", "application__client_id"
+        )
+    )
+    for token in revoked_tokens:
+        if not keep_evidence:
+            # No live security decision reads this row, so the account deletion keeps
+            # nothing: the token will simply be unknown.
+            continue
+        retain_until = None
+        if retention is not None:
+            retain_until = token["revoked"] + retention
+            if retain_until <= now:
+                # Past the evidence retention period: nothing to preserve.
+                continue
+        client_id = token["application__client_id"] or ""
+        evidence, created = RevokedTokenEvidence.objects.update_or_create(
+            token_checksum=token["token_checksum"],
+            defaults={
+                "token_family": token["token_family"],
+                "client_id": client_id,
+                "revoked_at": token["revoked"],
+                "retain_until": retain_until,
+            },
+        )
+        if created:
+            counts["revoked_evidence_created"] += 1
+
+    # Deleting the refresh tokens first deletes the access tokens bound to them
+    # (``RefreshToken.revoke()`` normally already did), then the explicit access-token
+    # delete reclaims the rest. Announcement counts are taken before each delete.
+    deletion_specs = (
+        ("refresh_tokens_deleted", refresh_token_model, models.Q(user=user)),
+        ("access_tokens_deleted", access_token_model, models.Q(user=user)),
+        ("id_tokens_deleted", id_token_model, models.Q(user=user)),
+        ("grants_deleted", grant_model, models.Q(user=user)),
+        ("device_grants_deleted", device_grant_model, models.Q(user=user)),
+    )
+    for key, model, query in deletion_specs:
+        counts[key] = model._default_manager.filter(query).count()
+        model._default_manager.filter(query).delete()
+
+    logger.info(
+        "purged credentials for a deleted account: %s",
+        ", ".join(f"{key}={value}" for key, value in counts.items()),
+    )
+    return counts
 
 
 # Neither side of the comparison is trusted to be bounded.  The requested URI is

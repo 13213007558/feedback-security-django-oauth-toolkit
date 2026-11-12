@@ -14,7 +14,9 @@ from oauth2_provider.models import (
     get_id_token_model,
     get_refresh_token_admin_class,
     get_refresh_token_model,
+    get_revoked_token_evidence_model,
     get_stored_authorization_request_model,
+    get_token_cleanup_run_model,
     revoke_access_token,
 )
 
@@ -273,12 +275,58 @@ class StoredAuthorizationRequestAdmin(admin.ModelAdmin):
         return mask_credential(obj.request_uri) if obj is not None else ""
 
 
+class RevokedTokenEvidenceAdmin(admin.ModelAdmin):
+    """
+    Read-only view of the non-credential revocation evidence kept for deleted accounts.
+
+    Neither the checksum nor the family id is a usable credential, but they correlate a
+    purged token with a session, so they are not searchable or shown on the change form;
+    the admin exists so an operator can audit retention, not inspect tokens.
+    """
+
+    list_display = ("pk", "client_id", "token_family", "revoked_at", "retain_until")
+    list_filter = ("client_id",)
+    readonly_fields = ("token_family", "client_id", "revoked_at", "retain_until", "created")
+
+    def has_add_permission(self, request):
+        # Evidence is written only by ``purge_user_credentials()``.
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+class TokenCleanupRunAdmin(admin.ModelAdmin):
+    """Audit the staged cleanup's progress; the fields are counts and phase names only."""
+
+    list_display = ("pk", "status", "phase", "batches", "started_at", "updated_at")
+    list_filter = ("status",)
+    readonly_fields = (
+        "status",
+        "phase",
+        "completed_phases",
+        "counts",
+        "batches",
+        "cutoffs",
+        "started_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
 application_model = get_application_model()
 access_token_model = get_access_token_model()
 grant_model = get_grant_model()
 id_token_model = get_id_token_model()
 refresh_token_model = get_refresh_token_model()
 stored_authorization_request_model = get_stored_authorization_request_model()
+RevokedTokenEvidence = get_revoked_token_evidence_model()
+TokenCleanupRun = get_token_cleanup_run_model()
 
 application_admin_class = get_application_admin_class()
 access_token_admin_class = get_access_token_admin_class()
@@ -292,3 +340,5 @@ admin.site.register(grant_model, grant_admin_class)
 admin.site.register(id_token_model, id_token_admin_class)
 admin.site.register(refresh_token_model, refresh_token_admin_class)
 admin.site.register(stored_authorization_request_model, StoredAuthorizationRequestAdmin)
+admin.site.register(RevokedTokenEvidence, RevokedTokenEvidenceAdmin)
+admin.site.register(TokenCleanupRun, TokenCleanupRunAdmin)

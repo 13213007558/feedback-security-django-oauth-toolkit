@@ -15,17 +15,20 @@ used:
 * those that have been idle longer than ``REFRESH_TOKEN_EXPIRE_SECONDS`` -- i.e. whose paired access
   token expired more than ``REFRESH_TOKEN_EXPIRE_SECONDS`` ago (see ``REFRESH_TOKEN_EXPIRE_SECONDS``
   for the idle-expiry semantics);
-* those that have been revoked for longer than the ``REFRESH_TOKEN_GRACE_PERIOD_SECONDS`` setting; and
 * orphaned refresh tokens -- non-revoked refresh tokens whose access token was deleted out of band,
   leaving nothing to refresh against. These are removed unconditionally, regardless of
-  ``REFRESH_TOKEN_EXPIRE_SECONDS``.
+  ``REFRESH_TOKEN_EXPIRE_SECONDS``; and
+* revoked refresh tokens once their retention period has passed (see below).
+
+It also deletes expired grants, expired stored authorization requests, and expired access and ID
+tokens.
 
 It is important that this command is run regularly (eg: via cron) to avoid cluttering the
 database with expired refresh tokens.
 
 If ``cleartokens`` runs daily the maximum delay before a refresh token is
 removed is its retention period (``REFRESH_TOKEN_EXPIRE_SECONDS`` for expired
-tokens, ``REFRESH_TOKEN_GRACE_PERIOD_SECONDS`` for revoked ones) + 1 day. This
+tokens, the retention period for revoked ones) + 1 day. This
 is normally not a problem since refresh tokens are long lived.
 
 Note that ``REFRESH_TOKEN_EXPIRE_SECONDS`` is also enforced when a refresh token is presented, so a
@@ -34,13 +37,58 @@ refresh token past its lifetime is rejected even if ``cleartokens`` has not yet 
 To prevent the CPU and RAM high peaks during deletion process use ``CLEAR_EXPIRED_TOKENS_BATCH_SIZE`` and
 ``CLEAR_EXPIRED_TOKENS_BATCH_INTERVAL`` settings to adjust the process speed.
 
-The ``cleartokens`` management command will also delete expired access and ID tokens alongside expired refresh tokens.
+**Revocation evidence is not an ordinary expiry.** With
+``REFRESH_TOKEN_REUSE_PROTECTION`` enabled, a revoked refresh token is what lets the server
+recognize a replay of a rotated token and revoke its family (RFC 9700 §4.14.2). Deleting those rows
+on the plain grace-period schedule would silently disable that judgment. ``cleartokens`` therefore
+keeps them for the longest of:
 
-Refresh tokens that have already been revoked (for example by refresh token rotation) are removed as
-soon as their ``REFRESH_TOKEN_GRACE_PERIOD_SECONDS`` grace period has passed, without waiting for
-``REFRESH_TOKEN_EXPIRE_SECONDS``. The exception is when ``REFRESH_TOKEN_REUSE_PROTECTION`` is enabled:
-revoked refresh tokens are then what allows reuse of a rotated token to be detected, so they are kept
-until they expire per ``REFRESH_TOKEN_EXPIRE_SECONDS``.
+* ``REFRESH_TOKEN_GRACE_PERIOD_SECONDS`` (so a client retrying within the grace window still works);
+* ``REFRESH_TOKEN_EXPIRE_SECONDS`` when ``REFRESH_TOKEN_REUSE_PROTECTION`` is on, which an explicit
+  ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` may lengthen but never shorten; and
+* ``REFRESH_TOKEN_EVIDENCE_RETENTION_SECONDS`` as a privacy retention cap when reuse protection is
+  off (a row is then not evidence for any live decision), bounded below by the grace period.
+
+When reuse protection is on, refresh tokens never age-expire, and no evidence retention is set,
+revoked tokens are kept indefinitely -- the same as before this option existed.
+
+.. _cleartokens-resume:
+
+**Resumable runs.** ``cleartokens`` deletes in phases and in bounded batches, and checkpoints
+progress in a ``TokenCleanupRun`` row after every batch. If a run is interrupted (deploy, timeout,
+Ctrl-C), run it again with ``--resume`` to continue from the phase it was in; without ``--resume`` a
+new run starts and the interrupted one is marked as such. Every phase is an idempotent deletion
+guarded by the same cutoff, so restarting from any point reaches the same state. Deleting rows
+earlier can only make *more* data eligible, never make a credential usable again: revoked tokens
+that still back a security judgment stay, and everything deleted is past a cutoff that validation
+already enforces.
+
+The command reports only counts and the cleanup run id -- never token values, checksums, user
+identifiers or client secrets. Use ``--format=json`` for cron/monitoring ingestion::
+
+    {"run_id": 12, "status": "completed", "phase": "expired_revocation_evidence", ...,
+     "counts": {"expired_grants": 0, "revoked_refresh_tokens": 4, ...}}
+
+.. _cleartokens-account-deletion:
+
+**Account deletion and minimal evidence.** Deleting a Django user cascades through
+``RefreshToken.user``, which removes every refresh token the account owned -- including the revoked
+rows reuse detection needs. Call ``oauth2_provider.models.purge_user_credentials(user)`` *before*
+deleting the user. It deletes every access token, refresh token, ID token, grant and device grant,
+and, when ``REFRESH_TOKEN_REUSE_PROTECTION`` is on, first copies for each revoked refresh token
+still inside its retention period a single ``RevokedTokenEvidence`` row containing only:
+
+* the token's SHA-256 checksum (recognizes a replay, does not yield a usable token);
+* the token family id and the client id (both non-secret, needed for the family sweep);
+* ``revoked_at`` and ``retain_until``.
+
+No raw token, user reference, scope or application foreign key is kept. A replay of a purged token
+is still rejected: ``validate_refresh_token`` finds the evidence and revokes the family exactly as
+for a live row -- but the purged token itself is never honored. Live (non-revoked) tokens need no
+evidence: once deleted, a replay is an unknown token and rejected as ``invalid_grant``. With reuse
+protection off, no evidence is kept at all: a revoked row backs no live decision, so retaining it
+would be personal data with no security purpose. ``cleartokens`` prunes evidence rows past
+``retain_until`` (``NULL``, keep indefinitely, is never pruned).
 
 Note: Refresh tokens need to expire before AccessTokens can be removed from the
 database. Using ``cleartokens`` without ``REFRESH_TOKEN_EXPIRE_SECONDS`` has limited effect.
