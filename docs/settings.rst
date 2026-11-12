@@ -106,7 +106,11 @@ SCOPES
 ~~~~~~
 .. note:: (0.12.0+) Only used if ``SCOPES_BACKEND_CLASS`` is set to the SettingsScopes default.
 
-A dictionary mapping each scope name to its human description.
+A dictionary mapping each scope name to its human description, shown on the consent page.
+The description is presentation only: a consent grants the *scope name*, so two names may
+share a description. A lazy translation (``gettext_lazy``) may be used and follows the active
+language; a scope with no description is not granted on the consent page. See
+:ref:`consent-scope-binding`.
 
 .. _settings_default_scopes:
 

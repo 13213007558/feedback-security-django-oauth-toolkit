@@ -12,9 +12,9 @@ from oauthlib.common import Request as OAuthlibRequest
 from oauthlib.common import urlencode
 from oauthlib.oauth2 import DeviceApplicationServer
 
+from oauth2_provider.authorization_server import consent
 from oauth2_provider.authorization_server.views.mixins import AuthorizationServerViewMixin
 from oauth2_provider.core.compat import login_not_required
-from oauth2_provider.core.scopes import get_scopes_backend
 from oauth2_provider.core.views import FormEncodedRequestMixin
 from oauth2_provider.models import (
     AbstractDeviceGrant,
@@ -215,6 +215,18 @@ class DeviceConfirmView(LoginRequiredMixin, FormView):
         action = form.cleaned_data["action"]
 
         if action == "accept":
+            # The End-User consents to what the page described. A scope whose
+            # description could not be obtained reliably was shown as withheld,
+            # so it cannot be authorized; the device must request it again.
+            permissions = consent.describe_scopes(
+                device.scope.split() if device.scope else [], self._application(), self.request
+            )
+            if not all(permission.available for permission in permissions):
+                unavailable = [permission.scope for permission in permissions if not permission.available]
+                return http.HttpResponseBadRequest(
+                    "These permissions cannot be described reliably right now, so they cannot be "
+                    f"granted: {', '.join(unavailable)}."
+                )
             device.status = device.AUTHORIZED
             device.save(update_fields=["status"])
             return super().form_valid(form)
@@ -231,12 +243,17 @@ class DeviceConfirmView(LoginRequiredMixin, FormView):
         context["application"] = get_object_or_404(get_application_model(), client_id=client_id)
 
         device = self.get_object()
-        all_scopes = get_scopes_backend().get_all_scopes()
         scopes = device.scope.split() if device.scope is not None else []
+        permissions = consent.describe_scopes(scopes, context["application"], self.request)
         context["scopes"] = scopes
-        context["scopes_descriptions"] = [all_scopes.get(scope, scope) for scope in scopes]
+        context["scope_permissions"] = permissions
+        context["scopes_descriptions"] = [permission.description for permission in permissions]
 
         return context
+
+    def _application(self):
+        """The Application the device grant was issued to."""
+        return get_object_or_404(get_application_model(), client_id=self.kwargs.get("client_id"))
 
 
 class DeviceGrantStatusView(LoginRequiredMixin, DetailView):

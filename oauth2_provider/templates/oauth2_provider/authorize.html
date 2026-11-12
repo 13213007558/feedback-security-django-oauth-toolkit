@@ -16,9 +16,15 @@
                 {% endfor %}
 
                 <p>{% trans "Application requires the following permissions" %}</p>
-                <ul>
-                    {% for scope in scopes_descriptions %}
-                        <li>{{ scope }}</li>
+                <ul class="scope-permissions">
+                    {% for permission in scope_permissions %}
+                        <li class="scope-permission{% if not permission.available %} scope-permission-unavailable{% endif %}">
+                            <code class="scope-name">{{ permission.scope }}</code>
+                            <span class="scope-description">{{ permission.description }}</span>
+                            {% if not permission.available %}
+                                <span class="scope-unavailable">{% trans "This permission cannot be granted." %}</span>
+                            {% endif %}
+                        </li>
                     {% endfor %}
                 </ul>
 

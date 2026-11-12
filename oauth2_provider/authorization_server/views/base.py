@@ -32,7 +32,7 @@ from oauthlib.openid.connect.core.exceptions import (
     RequestURINotSupported,
 )
 
-from oauth2_provider.authorization_server import par, stored_requests
+from oauth2_provider.authorization_server import consent, par, stored_requests
 from oauth2_provider.authorization_server.forms import AllowForm
 from oauth2_provider.authorization_server.oidc import request_objects
 from oauth2_provider.authorization_server.oidc.claims import (
@@ -90,6 +90,26 @@ class BaseAuthorizationView(LoginRequiredMixin, AuthorizationServerViewMixin, Vi
     def dispatch(self, request, *args, **kwargs):
         self.oauth2_data = {}
         return super().dispatch(request, *args, **kwargs)
+
+    # The authorization request parameters the signed consent binding covers, so a
+    # permission list signed for one request cannot be replayed into another.
+    _CONSENT_BINDING = (
+        "client_id",
+        "redirect_uri",
+        "response_type",
+        "state",
+        "nonce",
+        "code_challenge",
+        "code_challenge_method",
+    )
+
+    @classmethod
+    def _consent_binding(cls, data: dict) -> dict:
+        """The values a consent page's signed permission list is bound to."""
+        bound = {name: str(data.get(name) or "").strip() for name in cls._CONSENT_BINDING}
+        # The order of the values of response_type does not matter (RFC 6749 §3.1.1).
+        bound["response_type"] = " ".join(sorted(bound["response_type"].split()))
+        return bound
 
     def error_response(self, error, application, **kwargs):
         """
@@ -167,6 +187,14 @@ class AuthorizationView(BaseAuthorizationView, FormView):
             "acr_values": self.oauth2_data.get("acr_values", None),
             "resource": self.oauth2_data.get("resource", None),  # RFC 8707
         }
+        permissions = self.oauth2_data.get("scope_permissions")
+        if permissions:
+            # Bind the permission list to this authorization request. A submission
+            # from another request (or another page for this request, e.g. after a
+            # configuration change) fails verification in form_valid.
+            initial_data["scope_details"] = consent.sign_scope_details(
+                scopes, permissions, self._consent_binding(self.oauth2_data)
+            )
         return initial_data
 
     def form_valid(self, form: AllowForm) -> http.HttpResponse:
@@ -205,6 +233,10 @@ class AuthorizationView(BaseAuthorizationView, FormView):
             credentials["claims"] = form.cleaned_data.get("claims")
         if form.cleaned_data.get("acr_values", False):
             credentials["acr_values"] = form.cleaned_data.get("acr_values")
+        allow = form.cleaned_data.get("allow")
+        scopes, consent_error = self._consented_scopes(form, application, allow)
+        if consent_error is not None:
+            return consent_error
         if form.cleaned_data.get("resource", False):  # RFC 8707
             resource_value = form.cleaned_data.get("resource")
             # RFC 8707 uses repeated query params for multiple resources, but the
@@ -243,9 +275,6 @@ class AuthorizationView(BaseAuthorizationView, FormView):
                     return self.error_response(error, application)
             credentials["resource"] = resource_list
 
-        scopes = form.cleaned_data.get("scope")
-        allow = form.cleaned_data.get("allow")
-
         try:
             uri, headers, body, status = self.create_authorization_response(
                 request=self.request, scopes=scopes, credentials=credentials, allow=allow
@@ -256,6 +285,61 @@ class AuthorizationView(BaseAuthorizationView, FormView):
         self.success_url = uri
         log.debug("Success url for the request: {0}".format(self.success_url))
         return self.redirect(self.success_url, application)
+
+    def _consented_scopes(
+        self, form: AllowForm, application: "AbstractApplication", allow: bool
+    ) -> tuple[str, http.HttpResponse | None]:
+        """The scopes to grant for this consent submission, and an error response if none.
+
+        An approval must carry the signed permission list the page showed, for this
+        very authorization request. The scopes to grant are the identifiers in that
+        list — never the form's ``scope`` field, and never a description's text, so
+        two scopes with the same text stay distinct. Every description must still
+        have the identity it had when the page was rendered: if the configuration
+        changed in between, the user's selection no longer describes what would be
+        granted, so the request is refused and the user can reload the page.
+
+        A scope whose description could not be obtained reliably is never granted,
+        since consent to it cannot be shown to have been informed.
+        """
+        details = form.cleaned_data.get("scope_details")
+        if not allow:
+            # A denial grants nothing, so there is nothing to bind.
+            return form.cleaned_data.get("scope"), None
+        if not details:
+            # A custom authorize.html may not render the hidden permission list. The
+            # scopes then come from the request's own scope parameter and are validated
+            # by oauthlib as usual (an unknown one is invalid_scope), but the page that
+            # was shown cannot be tied to this submission. Warn, as for a missing
+            # signed claims request.
+            submitted = form.cleaned_data.get("scope") or ""
+            if submitted:
+                log.warning(
+                    "The consent form posted no scope_details field. A custom authorize.html must "
+                    "post the form's hidden fields back so the granted scopes are bound to what "
+                    "was shown."
+                )
+            return submitted, None
+        try:
+            payload = consent.verify_scope_details(details, self._consent_binding(form.cleaned_data))
+        except consent.ScopeConsentError as error:
+            return "", self._fatal_invalid_request(str(error))
+
+        permissions = consent.describe_scopes(payload["scopes"], application, self.request)
+        signatures = {permission.scope: permission.identity for permission in permissions}
+        if signatures != payload["descriptions"]:
+            return "", self._fatal_invalid_request(
+                "The permission descriptions changed while the consent page was open. "
+                "Reload the authorization request and review the permissions again."
+            )
+        if not all(permission.available for permission in permissions):
+            unavailable = [permission.scope for permission in permissions if not permission.available]
+            return "", self._fatal_invalid_request(
+                "These permissions cannot be described reliably right now, so they cannot be "
+                f"granted: {', '.join(unavailable)}. Reload the authorization request and "
+                "review the permissions again."
+            )
+        return " ".join(payload["scopes"]), None
 
     # The request parameters a signed claims request is bound to, so one signed for
     # another authorization request cannot be posted with this one. A client that
@@ -763,12 +847,19 @@ class AuthorizationView(BaseAuthorizationView, FormView):
                 return max_age_response
 
         all_scopes = get_scopes_backend().get_all_scopes()
-        kwargs["scopes_descriptions"] = [all_scopes[scope] for scope in scopes]
-        kwargs["scopes"] = scopes
         # at this point we know an Application instance with such client_id exists in the database
 
         # TODO: Cache this!
         application = get_application_model().objects.get(client_id=credentials["client_id"])
+
+        # The consent page's permission rows: each requested scope with the text
+        # that describes it, and whether it can be consented to at all. They are
+        # bound to the submission by a signature over the scope identifiers and the
+        # language-independent identity of each description, never by the text.
+        permissions = consent.describe_scopes(scopes, application, request)
+        kwargs["scope_permissions"] = permissions
+        kwargs["scopes_descriptions"] = [permission.description for permission in permissions]
+        kwargs["scopes"] = scopes
 
         kwargs["application"] = application
         kwargs["client_id"] = credentials["client_id"]

@@ -98,6 +98,11 @@ This template gets passed the following context variables:
 .. caution::
     See :ref:`settings_default_scopes` to understand what is returned if no scopes are requested.
 
+- ``scope_permissions`` - :obj:`list` of ``ScopePermission`` objects, one per requested scope, with
+  ``scope`` (the identifier), ``description`` (the text shown), and ``available`` (whether it may
+  be granted). Render the identifier and the description together; a scope whose description
+  cannot be obtained reliably has ``available`` false and is not granted if approved;
+
 - ``scopes_descriptions`` - :obj:`list` with the descriptions for the scopes requested;
 
 - ``requested_claims`` - sorted :obj:`list` with the names of the individual claims requested through the
@@ -124,6 +129,8 @@ This template gets passed the following context variables:
 - ``response_mode`` - Passed in the URI (optional).
 - ``state`` - Passed in the URI (optional).
 - ``form`` - An :class:`~oauth2_provider.forms.AllowForm` with all the hidden fields already filled with the values above.
+  The hidden-field loop must be kept: it includes ``scope_details``, the signed permission list an
+  approval is bound to. The granted scopes come from that list, not from the visible ``scope`` field.
 
 .. important::
     One extra variable, named ``error`` will also be available if an Oauth2 exception occurs.
@@ -149,9 +156,15 @@ Example (this is the default page you may find on ``templates/oauth2_provider/au
                     {% endfor %}
 
                     <p>{% trans "Application requires the following permissions" %}</p>
-                    <ul>
-                        {% for scope in scopes_descriptions %}
-                            <li>{{ scope }}</li>
+                    <ul class="scope-permissions">
+                        {% for permission in scope_permissions %}
+                            <li>
+                                <code class="scope-name">{{ permission.scope }}</code>
+                                <span class="scope-description">{{ permission.description }}</span>
+                                {% if not permission.available %}
+                                    <span class="scope-unavailable">{% trans "This permission cannot be granted." %}</span>
+                                {% endif %}
+                            </li>
                         {% endfor %}
                     </ul>
 

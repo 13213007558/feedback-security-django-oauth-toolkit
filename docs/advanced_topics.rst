@@ -453,8 +453,41 @@ The backend used is controlled by the ``SCOPES_BACKEND_CLASS`` setting, which de
             specifying any scope. This MUST be a subset of ``get_available_scopes``.
             """
 
-``get_available_scopes`` and ``get_default_scopes`` receive the ``application`` and ``request``
-in play, so a backend can vary the offered scopes per application or per request.
+        def get_scope_description(self, scope, application=None, request=None, *args, **kwargs):
+            """
+            Return the human-readable description of ``scope`` shown on the consent page, or
+            ``None`` when no reliable description can be produced. The default reads
+            ``get_all_scopes()``; override it if descriptions come from elsewhere or depend on
+            the application/request.
+            """
+
+``get_available_scopes``, ``get_default_scopes`` and ``get_scope_description`` receive the
+``application`` and ``request`` in play, so a backend can vary the offered scopes per application
+or per request.
+
+.. _consent-scope-binding:
+
+Scope descriptions and consent
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The consent page lists a scope with its description, but the description is only presentation:
+what the End-User approves is the *scope identifier*, and that identifier is what the grant and
+the tokens record. Two scopes may have the same description without ever being confused.
+
+The page's permission list is signed (``scope_details``, a hidden form field) together with the
+authorization request it belongs to: the requested identifiers and a language-independent identity
+for each description. On approval the server grants the identifiers in that signed list -- never
+the text, and never whatever the ``scope`` form field claims -- and recomputes each description's
+identity. If a description changed while the page was open (a settings change, or a backend that
+now returns different text), the submission is refused with ``invalid_request`` rather than granting
+permissions described with text the user never saw. A lazy translation (``gettext_lazy``) keeps the
+same identity when the active language changes, so switching language does not invalidate consent.
+
+A scope whose description the backend cannot produce reliably -- missing, blank, not a string, or
+an error while reading it -- is marked unavailable. It is shown as withheld and cannot be granted:
+approving it fails with ``invalid_request``. If you add a sensitive scope, make sure
+``get_scope_description()`` can describe it before clients can request it; otherwise the consent
+page refuses to grant it rather than guessing a wording.
 
 Model-based scopes
 ~~~~~~~~~~~~~~~~~~

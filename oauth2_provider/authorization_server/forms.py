@@ -21,6 +21,11 @@ class AllowForm(forms.Form):
     allow = forms.BooleanField(required=False)
     redirect_uri = forms.CharField(widget=forms.HiddenInput())
     scope = forms.CharField(widget=forms.HiddenInput())
+    # The signed list of permissions the consent page showed: the requested scope
+    # identifiers and the identity of each description. The scopes the user
+    # approved are taken from it, never from the ``scope`` field or from the
+    # descriptions themselves (see ``oauth2_provider.authorization_server.consent``).
+    scope_details = forms.CharField(required=False, widget=forms.HiddenInput())
     nonce = forms.CharField(required=False, widget=forms.HiddenInput())
     client_id = forms.CharField(widget=forms.HiddenInput())
     state = forms.CharField(required=False, widget=forms.HiddenInput())

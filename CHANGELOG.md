@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Scope descriptions shown on the consent page now support lazy translations, and a custom
+  scopes backend can supply them per scope, application and request through the new
+  `get_scope_description(scope, application=None, request=None)` hook. The consent page shows
+  each scope's identifier beside its description, so two scopes that share a description
+  remain distinct.
+* The consent page's permission list is signed and bound to the authorization request, and an
+  approval grants exactly the scope identifiers it lists: the visible `scope` field and the
+  description text never decide what is granted. A description that changed while the page was
+  open (a settings change, or a backend returning different text) makes the approval fail with
+  `invalid_request` instead of granting permissions described with text the user did not see;
+  a language switch does not. A scope whose description cannot be obtained reliably is shown as
+  withheld and cannot be granted. The device verification page uses the same permission list
+  and refuses to authorize a scope it cannot describe. Swapped grant models need no migration:
+  the binding is carried in the consent form, not stored on the model.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new
