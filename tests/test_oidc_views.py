@@ -55,6 +55,7 @@ class TestConnectDiscoveryInfoView(TestCase):
                 "code id_token",
                 "code id_token token",
             ],
+            "response_modes_supported": ["query", "fragment", "form_post"],
             "grant_types_supported": [
                 "authorization_code",
                 "implicit",
@@ -147,6 +148,7 @@ class TestConnectDiscoveryInfoView(TestCase):
                 "code id_token",
                 "code id_token token",
             ],
+            "response_modes_supported": ["query", "fragment", "form_post"],
             "grant_types_supported": [
                 "authorization_code",
                 "implicit",
@@ -188,6 +190,7 @@ class TestConnectDiscoveryInfoView(TestCase):
                 "code id_token",
                 "code id_token token",
             ],
+            "response_modes_supported": ["query", "fragment", "form_post"],
             "grant_types_supported": [
                 "authorization_code",
                 "implicit",
@@ -236,6 +239,7 @@ class TestConnectDiscoveryInfoView(TestCase):
                 "code id_token",
                 "code id_token token",
             ],
+            "response_modes_supported": ["query", "fragment", "form_post"],
             "grant_types_supported": [
                 "authorization_code",
                 "implicit",
@@ -380,6 +384,7 @@ class TestRPInitiatedRegistration(TestCase):
                 "code id_token",
                 "code id_token token",
             ],
+            "response_modes_supported": ["query", "fragment", "form_post"],
             "grant_types_supported": [
                 "authorization_code",
                 "implicit",
@@ -1541,6 +1546,7 @@ class TestOAuthServerMetadataView(TestCase):
             "revocation_endpoint": "http://localhost/o/revoke_token/",
             "introspection_endpoint": "http://localhost/o/introspect/",
             "response_types_supported": ["code", "token"],
+            "response_modes_supported": ["query", "fragment", "form_post"],
             "grant_types_supported": [
                 "authorization_code",
                 "implicit",
@@ -1573,6 +1579,7 @@ class TestOAuthServerMetadataView(TestCase):
             "revocation_endpoint": "http://testserver/o/revoke_token/",
             "introspection_endpoint": "http://testserver/o/introspect/",
             "response_types_supported": ["code", "token"],
+            "response_modes_supported": ["query", "fragment", "form_post"],
             "grant_types_supported": [
                 "authorization_code",
                 "implicit",

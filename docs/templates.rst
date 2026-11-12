@@ -18,6 +18,7 @@ The templates available are:
 
 - `base.html`_
 - `authorize.html`_
+- `form_post.html`_
 - `client_branding.html`_
 - `Management`_:
     - `Application`_:
@@ -181,6 +182,28 @@ Example (this is the default page you may find on ``templates/oauth2_provider/au
             {% endif %}
         </div>
     {% endblock %}
+
+
+form_post.html
+--------------
+
+Rendered by :class:`~oauth2_provider.authorization_server.views.base.AuthorizationView`
+when the client asks for ``response_mode=form_post`` (see
+:ref:`oidc-form-post`). It auto-submits a form that POSTs the authorization
+response to the registered redirect URI.
+
+This template gets passed the following context variables:
+
+- ``action`` - the validated registered redirect URI the form posts to, with no
+  response parameters in its query or fragment;
+- ``fields`` - an ordered :obj:`list` of ``(name, value)`` pairs, the response
+  parameters rendered as hidden controls.
+
+A replacement template must keep a working submit control inside ``<noscript>``
+so the response can still be delivered without JavaScript, must not render
+``fields`` anywhere other than the hidden controls, and must not add links that
+embed the response parameters. The view already sets ``Cache-Control:
+no-store, no-cache``, ``Pragma: no-cache`` and ``Referrer-Policy: no-referrer``.
 
 
 client_branding.html

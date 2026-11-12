@@ -19,6 +19,7 @@ from oauth2_provider.authorization_server.forms import ConfirmLogoutForm
 from oauth2_provider.authorization_server.oidc import request_objects
 from oauth2_provider.authorization_server.oidc.mixins import OIDCLogoutOnlyMixin, OIDCOnlyMixin
 from oauth2_provider.authorization_server.oidc.server import userinfo_signing_available
+from oauth2_provider.authorization_server.response_modes import supported_response_modes
 from oauth2_provider.authorization_server.views.metadata import (
     ServerMetadataViewMixin,
     bcp_filter_code_challenge_methods,
@@ -87,6 +88,7 @@ class ConnectDiscoveryInfoView(ServerMetadataViewMixin, OIDCOnlyMixin, View):
             # RFC 9700: mirror the RFC 8414 metadata gating so both discovery documents
             # agree with what the server actually accepts.
             "response_types_supported": response_types,
+            "response_modes_supported": list(supported_response_modes()),
             # OpenID Connect Discovery 1.0 section 3 defaults this to
             # ["authorization_code", "implicit"] when omitted, which hides refresh_token.
             "grant_types_supported": bcp_filter_grant_types(

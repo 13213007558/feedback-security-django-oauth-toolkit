@@ -519,6 +519,75 @@ class TestAuthorizationCodeView(BaseTest):
         query_data = {
             "client_id": self.application.client_id,
             "response_type": "code",
+            "response_mode": "not-a-mode",
+            "state": "random_state_string",
+            "scope": "read write",
+            "redirect_uri": "http://example.org",
+        }
+
+        response = self.client.get(reverse("oauth2_provider:authorize"), data=query_data)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("Location", response)
+
+    def test_form_post_response_mode_success(self):
+        """form_post renders the code in hidden controls, never in a URL."""
+        self.oauth2_settings.PKCE_REQUIRED = False
+        self.client.login(username="test_user", password="123456")
+        form_data = {
+            "client_id": self.application.client_id,
+            "response_type": "code",
+            "response_mode": "form_post",
+            "state": "random_state_string",
+            "scope": "read write",
+            "redirect_uri": "http://example.org",
+            "allow": True,
+        }
+
+        response = self.client.post(reverse("oauth2_provider:authorize"), data=form_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Location", response)
+        body = response.content.decode()
+        self.assertIn('action="http://example.org"', body)
+        self.assertIn('method="post"', body)
+        self.assertIn('name="state" value="random_state_string"', body)
+        self.assertRegex(body, r'name="code" value="[^"]+"')
+        # The code never appears in a query or fragment.
+        self.assertNotIn("http://example.org?", body)
+        self.assertEqual(response["Cache-Control"], "no-store, no-cache")
+        self.assertEqual(response["Referrer-Policy"], "no-referrer")
+
+    def test_form_post_response_mode_denied(self):
+        """A denial is posted back to the same validated redirect target."""
+        self.oauth2_settings.PKCE_REQUIRED = False
+        self.client.login(username="test_user", password="123456")
+        form_data = {
+            "client_id": self.application.client_id,
+            "response_type": "code",
+            "response_mode": "form_post",
+            "state": "random_state_string",
+            "scope": "read write",
+            "redirect_uri": "http://example.org",
+            "allow": False,
+        }
+
+        response = self.client.post(reverse("oauth2_provider:authorize"), data=form_data)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        self.assertIn('action="http://example.org"', body)
+        self.assertIn('name="error" value="access_denied"', body)
+        self.assertIn('name="state" value="random_state_string"', body)
+
+    def test_form_post_response_mode_disabled(self):
+        """With the feature switched off, form_post is refused like any unknown mode."""
+        self.oauth2_settings.PKCE_REQUIRED = False
+        self.oauth2_settings.FORM_POST_RESPONSE_MODE_ENABLED = False
+        self.client.login(username="test_user", password="123456")
+        query_data = {
+            "client_id": self.application.client_id,
+            "response_type": "code",
             "response_mode": "form_post",
             "state": "random_state_string",
             "scope": "read write",

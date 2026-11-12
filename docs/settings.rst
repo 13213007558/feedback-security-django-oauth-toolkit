@@ -397,6 +397,21 @@ are not interchangeable at request time. The redundant ``com.example.app:///oaut
 and the rootless ``com.example.app:oauth2redirect`` are rejected. Schemes that require an
 authority (``http``, ``https``, ``ws``, ``wss``, ``ftp``) must still include a host.
 
+FORM_POST_RESPONSE_MODE_ENABLED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``True``
+
+Whether the authorization endpoint honours ``response_mode=form_post``
+(`OAuth 2.0 Form Post Response Mode
+<https://openid.net/specs/oauth-v2-form-post-response-mode-1_0.html>`_). When
+enabled, a successful authorization response, and any error that may be returned
+to the client, is rendered as an auto-submitting HTML form that POSTs the
+response parameters to the registered redirect URI, so no credential enters a
+URL. The form target is validated exactly like a redirect target. Set this to
+``False`` to refuse the mode with an HTTP 400 and no redirect, as earlier
+releases did. See :ref:`the Form Post section <oidc-form-post>` of the OIDC
+documentation for the full behaviour.
+
 ALLOWED_SCHEMES
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default: ``["https"]``

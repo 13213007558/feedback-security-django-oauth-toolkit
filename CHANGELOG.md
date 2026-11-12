@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Optional OAuth 2.0 Form Post Response Mode
+  (https://openid.net/specs/oauth-v2-form-post-response-mode-1_0.html): a client may
+  request `response_mode=form_post` and the authorization endpoint renders an
+  auto-submitting HTML form (with a `noscript` submit button) that POSTs the response
+  parameters to the registered redirect URI, so no credential enters a URL. Success and
+  the errors that may be returned to the client use the same registered-URI validation as
+  a redirect; requests whose redirect URI cannot be trusted are rendered on the site
+  instead. The page sets `Cache-Control: no-store, no-cache`, `Pragma: no-cache` and
+  `Referrer-Policy: no-referrer` and does not repeat the parameters in links or
+  diagnostics. The mode works for every response type, is advertised as
+  `response_modes_supported` in the RFC 8414 metadata and OpenID discovery documents, and
+  can be disabled with the new `FORM_POST_RESPONSE_MODE_ENABLED` setting (default `True`).
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

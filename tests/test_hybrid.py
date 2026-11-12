@@ -1594,25 +1594,57 @@ class TestHybridErrorResponseMode(BaseTest):
         not the request carries another error.
         """
         self.client.login(username="hy_test_user", password="123456")
-        for response_mode in ("form_post", "not-a-mode"):
-            for scope in ("openid", "openid not-a-scope"):
-                data = {
-                    "client_id": self.application.client_id,
-                    "state": "random_state_string",
-                    "nonce": "random_nonce_string",
-                    "scope": scope,
-                    "redirect_uri": "http://example.org",
-                    "response_type": "code id_token",
-                    "response_mode": response_mode,
-                }
-                with self.subTest(response_mode=response_mode, scope=scope, method="GET"):
-                    response = self.client.get(reverse("oauth2_provider:authorize"), data=data)
-                    self.assert_rejected_without_redirect(response)
-                with self.subTest(response_mode=response_mode, scope=scope, method="POST"):
-                    response = self.client.post(
-                        reverse("oauth2_provider:authorize"), data={**data, "allow": True}
-                    )
-                    self.assert_rejected_without_redirect(response)
+        response_mode = "not-a-mode"
+        for scope in ("openid", "openid not-a-scope"):
+            data = {
+                "client_id": self.application.client_id,
+                "state": "random_state_string",
+                "nonce": "random_nonce_string",
+                "scope": scope,
+                "redirect_uri": "http://example.org",
+                "response_type": "code id_token",
+                "response_mode": response_mode,
+            }
+            with self.subTest(scope=scope, method="GET"):
+                response = self.client.get(reverse("oauth2_provider:authorize"), data=data)
+                self.assert_rejected_without_redirect(response)
+            with self.subTest(scope=scope, method="POST"):
+                response = self.client.post(
+                    reverse("oauth2_provider:authorize"), data={**data, "allow": True}
+                )
+                self.assert_rejected_without_redirect(response)
+
+    def test_form_post_response_mode_posts_hybrid_parameters(self):
+        """
+        form_post is valid for a hybrid response type too: the code and id_token are
+        delivered in hidden controls rather than the fragment.
+        """
+        self.client.login(username="hy_test_user", password="123456")
+        data = {
+            "client_id": self.application.client_id,
+            "state": "random_state_string",
+            "nonce": "random_nonce_string",
+            "scope": "openid",
+            "redirect_uri": "http://example.org",
+            "response_type": "code id_token",
+            "response_mode": "form_post",
+        }
+
+        response = self.client.post(reverse("oauth2_provider:authorize"), data={**data, "allow": True})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Location", response)
+        body = response.content.decode()
+        self.assertIn('action="http://example.org"', body)
+        self.assertIn('method="post"', body)
+        self.assertIn('name="code"', body)
+        self.assertIn('name="id_token"', body)
+        self.assertIn('name="state" value="random_state_string"', body)
+        # Nothing is appended to the action URL.
+        self.assertNotIn("http://example.org?", body)
+        self.assertNotIn("http://example.org#", body)
+        self.assertEqual(response["Cache-Control"], "no-store, no-cache")
+        self.assertEqual(response["Referrer-Policy"], "no-referrer")
 
 
 @pytest.mark.usefixtures("oidc_key")

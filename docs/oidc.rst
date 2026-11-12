@@ -275,12 +275,39 @@ The values of a multi-valued ``response_type`` may be sent in any order
 ``code id_token``, and ``token id_token`` like ``id_token token``. A value that
 names the same response type twice is refused.
 
-The supported values of ``response_mode`` are ``query`` and ``fragment``, and
-``query`` is not permitted for response types containing ``token`` or
-``id_token``. A request with any other value, ``form_post`` included, is refused
-with an HTTP 400 and no redirect, as `OpenID Connect Core 1.0 §3.1.2.6
+The supported values of ``response_mode`` are ``query``, ``fragment`` and
+``form_post``. ``query`` is not permitted for response types containing
+``token`` or ``id_token``. A genuinely unknown value is refused with an HTTP 400
+and no redirect, as `OpenID Connect Core 1.0 §3.1.2.6
 <https://openid.net/specs/openid-connect-core-1_0.html#AuthError>`_ requires,
 because the error cannot be returned in a mode the server does not support.
+
+.. _oidc-form-post:
+
+Form Post Response Mode
+~~~~~~~~~~~~~~~~~~~~~~~
+
+With ``response_mode=form_post`` (`OAuth 2.0 Form Post Response Mode
+<https://openid.net/specs/oauth-v2-form-post-response-mode-1_0.html>`_), the
+authorization response is never placed in a URL. The authorization endpoint
+renders an HTML page whose form targets the *registered* redirect URI and
+carries the response parameters (the authorization ``code``, an implicit or
+hybrid ``access_token``/``id_token``, ``state``, ``iss``, or an ``error``) as
+hidden controls. The form auto-submits on load, and a ``<noscript>`` block keeps
+a submit button so the response can still be delivered without JavaScript. The
+same registered-URI validation used for a ``query``/``fragment`` redirect decides
+the form target, for a successful response and for any error that may be
+returned to the client; a request whose redirect URI cannot be trusted is not
+posted anywhere and the error is rendered on the authorization server instead.
+
+The page is sent with ``Cache-Control: no-store, no-cache``, ``Pragma:
+no-cache`` and ``Referrer-Policy: no-referrer``, and contains no link or other
+markup that repeats the response parameters, so the credentials are not exposed
+through caching, the browser history or the ``Referer`` header. The mode is
+valid for every response type, including the implicit and hybrid flows, and is
+advertised as ``response_modes_supported`` in the RFC 8414 metadata and OpenID
+Connect discovery documents. Set ``FORM_POST_RESPONSE_MODE_ENABLED`` to
+``False`` to disable it and refuse ``response_mode=form_post`` as before.
 
 .. _oidc-authorization-request-post:
 

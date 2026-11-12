@@ -27,7 +27,6 @@ NOT_SUPPORTED = [
     ("RFC 9101", "JWT-Secured Authorization Request (JAR)", "No request/request_uri object support."),
     ("RFC 9449", "DPoP", "No DPoP-bound tokens."),
     ("RFC 8705", "mTLS client authentication", "No tls_client_auth / self_signed_tls_client_auth."),
-    ("OAuth 2.0 Form Post Response Mode", "response_mode=form_post", "Only query/fragment."),
     ("OIDC Session Management / Logout", "Back-/Front-Channel Logout", "Only RP-Initiated Logout."),
     ("OpenID Connect Core 1.0", "pairwise subject type", "Only public subject type."),
 ]

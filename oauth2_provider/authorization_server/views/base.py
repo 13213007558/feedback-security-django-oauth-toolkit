@@ -43,7 +43,10 @@ from oauth2_provider.authorization_server.oidc.claims import (
     safe_normalize_claims_request,
 )
 from oauth2_provider.authorization_server.oidc.max_age import INVALID_MAX_AGE_DESCRIPTION, is_valid_max_age
-from oauth2_provider.authorization_server.response_modes import add_params_to_authorization_redirect
+from oauth2_provider.authorization_server.response_modes import (
+    FORM_POST_RESPONSE_MODE,
+    add_params_to_authorization_redirect,
+)
 from oauth2_provider.authorization_server.sessions import (
     get_session_authentication_event,
     get_session_authentication_time,
@@ -51,7 +54,7 @@ from oauth2_provider.authorization_server.sessions import (
 from oauth2_provider.authorization_server.views.mixins import AuthorizationServerViewMixin
 from oauth2_provider.core.compat import login_not_required
 from oauth2_provider.core.exceptions import FatalClientError, OAuthToolkitError
-from oauth2_provider.core.http import OAuth2ResponseRedirect
+from oauth2_provider.core.http import OAuth2FormPostResponse, OAuth2ResponseRedirect
 from oauth2_provider.core.scopes import get_scopes_backend
 from oauth2_provider.core.signals import app_authorized
 from oauth2_provider.core.utils import add_iss_to_redirect
@@ -99,19 +102,39 @@ class BaseAuthorizationView(LoginRequiredMixin, AuthorizationServerViewMixin, Vi
         redirect, error_response = super().error_response(error, **kwargs)
 
         if redirect:
-            return self.redirect(error_response["url"], application)
+            # The validated redirect URI, without response parameters, so a Form
+            # Post page can use it as the form action while keeping every parameter
+            # in the POST body.
+            redirect_uri = error.oauthlib_error.redirect_uri or None
+            return self.redirect(error_response["url"], application, redirect_uri=redirect_uri)
 
         status = error_response["error"].status_code
         return self.render_to_response(error_response, status=status)
 
-    def redirect(self, redirect_to, application):
+    def redirect(self, redirect_to, application, redirect_uri=None):
         if application is None:
             # The application can be None in case of an error during app validation
             # In such cases, fall back to default ALLOWED_REDIRECT_URI_SCHEMES
             allowed_schemes = oauth2_settings.ALLOWED_REDIRECT_URI_SCHEMES
         else:
             allowed_schemes = application.get_allowed_schemes()
+        if self._response_is_form_post():
+            # The target is the same validated redirect URI a 302 would use, and the
+            # parameters stay in the POST body, so no credential enters a URL.
+            return OAuth2FormPostResponse(redirect_to, allowed_schemes, redirect_uri=redirect_uri)
         return OAuth2ResponseRedirect(redirect_to, allowed_schemes)
+
+    def _response_is_form_post(self) -> bool:
+        """Whether the current authorization response must be delivered by Form Post.
+
+        A consent POST keeps ``response_mode`` in its hidden form field; every other
+        path (the GET, a stored request and the 303 an authorization-request POST
+        gets) leaves it in the query string. Checking both covers every caller of
+        :meth:`redirect` without threading another argument through the flow.
+        """
+        return self.request.GET.get("response_mode") == FORM_POST_RESPONSE_MODE or (
+            self.request.POST.get("response_mode") == FORM_POST_RESPONSE_MODE
+        )
 
 
 RFC3339 = "%Y-%m-%dT%H:%M:%SZ"
@@ -255,7 +278,7 @@ class AuthorizationView(BaseAuthorizationView, FormView):
 
         self.success_url = uri
         log.debug("Success url for the request: {0}".format(self.success_url))
-        return self.redirect(self.success_url, application)
+        return self.redirect(self.success_url, application, redirect_uri=credentials.get("redirect_uri"))
 
     # The request parameters a signed claims request is bound to, so one signed for
     # another authorization request cannot be posted with this one. A client that
@@ -847,7 +870,7 @@ class AuthorizationView(BaseAuthorizationView, FormView):
                 uri, headers, body, status = self.create_authorization_response(
                     request=self.request, scopes=" ".join(scopes), credentials=credentials, allow=True
                 )
-                return self.redirect(uri, application)
+                return self.redirect(uri, application, redirect_uri=credentials.get("redirect_uri"))
 
             # prompt=none forbids a consent page (OpenID Connect Core 1.0
             # section 3.1.2.1), so a grant the user already made is the
@@ -881,7 +904,7 @@ class AuthorizationView(BaseAuthorizationView, FormView):
                             credentials=credentials,
                             allow=True,
                         )
-                        return self.redirect(uri, application)
+                        return self.redirect(uri, application, redirect_uri=credentials.get("redirect_uri"))
 
         except OAuthToolkitError as error:
             return self.error_response(error, application)
@@ -1269,7 +1292,7 @@ class AuthorizationView(BaseAuthorizationView, FormView):
         if oauth2_settings.COMPLIANT_BCP_RFC9700_AUTHZ_RESPONSE_ISS:
             issuer = oauth2_settings.oauth2_authorization_server_issuer(self.request)
             redirect_to = add_iss_to_redirect(redirect_to, issuer)
-        return self.redirect(redirect_to, application)
+        return self.redirect(redirect_to, application, redirect_uri=redirect_uri)
 
     def handle_no_permission(self):
         """

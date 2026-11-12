@@ -15,6 +15,7 @@ from django.views.generic import View
 
 from oauth2_provider.authorization_server import client_assertions
 from oauth2_provider.authorization_server.oidc import request_objects
+from oauth2_provider.authorization_server.response_modes import supported_response_modes
 from oauth2_provider.core.compat import login_not_required
 from oauth2_provider.models import AbstractGrant
 from oauth2_provider.settings import oauth2_settings
@@ -177,6 +178,9 @@ class OAuthServerMetadataView(ServerMetadataViewMixin, View):
         # Capability fields describe a specific endpoint, so only advertise them
         # when that endpoint is actually present.
         if "authorization_endpoint" in data:
+            # RFC 8414 / OpenID Connect Discovery 1.0: the response modes the
+            # authorization endpoint honours.
+            data["response_modes_supported"] = list(supported_response_modes())
             # RFC 9700 §2.1.1: drop "plain" from discovery when it is no longer accepted.
             data["code_challenge_methods_supported"] = bcp_filter_code_challenge_methods(
                 [key for key, _ in AbstractGrant.CODE_CHALLENGE_METHODS]

@@ -125,6 +125,14 @@ DEFAULTS = {
     "ALLOWED_SCHEMES": ["https"],
     "ALLOW_URI_WILDCARDS": False,
     "ALLOW_LOCALHOST_LOOPBACK": False,
+    # OAuth 2.0 Form Post Response Mode
+    # (https://openid.net/specs/oauth-v2-form-post-response-mode-1_0.html):
+    # when enabled, a client may ask for response_mode=form_post and the
+    # authorization response (success or an error that may be returned to the
+    # client) is rendered as an auto-submitting HTML form that POSTs the
+    # parameters to the registered redirect URI, so no credential ever enters a
+    # URL. Set to False to keep refusing the mode.
+    "FORM_POST_RESPONSE_MODE_ENABLED": True,
     # Factories building the validators Application.clean() applies to each redirect uri
     # and each allowed origin. Each is called with the application and returns a callable
     # taking one URI string. Keep these as import strings rather than direct references:

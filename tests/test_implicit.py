@@ -537,6 +537,41 @@ class TestImplicitErrorResponseMode(BaseTest):
         self.assertEqual(response.status_code, 400)
         self.assertNotIn("Location", response)
 
+    def assert_form_post(self, response, action="http://example.org"):
+        """
+        A Form Post response renders an auto-submitting form whose action is the
+        registered redirect URI and whose hidden controls carry the response
+        parameters, with no redirect and no caching or Referer leakage.
+        """
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Location", response)
+        body = response.content.decode()
+        self.assertIn(f'action="{action}"', body)
+        self.assertIn('method="post"', body)
+        self.assertEqual(response["Cache-Control"], "no-store, no-cache")
+        self.assertEqual(response["Referrer-Policy"], "no-referrer")
+        # The credentials never appear in a URL on the page.
+        self.assertNotIn(action + "?", body)
+        self.assertNotIn(action + "#", body)
+        return body
+
+    def form_post_fields(self, response):
+        from html.parser import HTMLParser
+
+        class Parser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.fields = {}
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "input" and attrs.get("type") == "hidden":
+                    self.fields[attrs["name"]] = attrs["value"]
+
+        parser = Parser()
+        parser.feed(response.content.decode())
+        return parser.fields
+
     def test_query_response_mode_rejected(self):
         """
         The query encoding must not be used for response types that return tokens
@@ -559,26 +594,46 @@ class TestImplicitErrorResponseMode(BaseTest):
 
     def test_unsupported_response_mode_rejected(self):
         self.client.login(username="test_user", password="123456")
-        for response_mode in ("form_post", "not-a-mode"):
-            with self.subTest(response_mode=response_mode):
-                query_data = {
-                    "client_id": self.application.client_id,
-                    "response_type": "id_token token",
-                    "response_mode": response_mode,
-                    "state": "random_state_string",
-                    "nonce": "random_nonce_string",
-                    "scope": "openid",
-                    "redirect_uri": "http://example.org",
-                }
+        # form_post is supported for front-channel response types too, since its
+        # parameters leave the URL entirely; only a genuinely unknown mode is refused.
+        query_data = {
+            "client_id": self.application.client_id,
+            "response_type": "id_token token",
+            "response_mode": "not-a-mode",
+            "state": "random_state_string",
+            "nonce": "random_nonce_string",
+            "scope": "openid",
+            "redirect_uri": "http://example.org",
+        }
 
-                response = self.client.get(reverse("oauth2_provider:authorize"), data=query_data)
+        response = self.client.get(reverse("oauth2_provider:authorize"), data=query_data)
 
-                self.assert_rejected_without_redirect(response)
+        self.assert_rejected_without_redirect(response)
 
-    def test_unsupported_response_mode_rejected_on_error_paths(self):
+    def test_form_post_response_mode_returns_form(self):
+        self.client.login(username="test_user", password="123456")
+        query_data = {
+            "client_id": self.application.client_id,
+            "response_type": "id_token token",
+            "response_mode": "form_post",
+            "state": "random_state_string",
+            "nonce": "random_nonce_string",
+            "scope": "openid",
+            "redirect_uri": "http://example.org",
+        }
+
+        response = self.client.post(reverse("oauth2_provider:authorize"), data={**query_data, "allow": True})
+
+        self.assert_form_post(response)
+        fields = self.form_post_fields(response)
+        self.assertIn("id_token", fields)
+        self.assertIn("access_token", fields)
+        self.assertEqual(fields["state"], "random_state_string")
+
+    def test_form_post_response_mode_on_error_paths(self):
         """
-        Errors raised before oauthlib reaches validate_response_type, or built by the
-        toolkit itself, must not be redirected in a mode the client did not ask for.
+        Errors that may be returned to the client use the same Form Post target
+        validation as the successful response, instead of a redirect in another mode.
         """
         self.client.login(username="test_user", password="123456")
         base = {
@@ -590,21 +645,34 @@ class TestImplicitErrorResponseMode(BaseTest):
             "response_mode": "form_post",
         }
         cases = {
-            "deny": ("post", {**base, "response_type": "id_token", "allow": False}),
+            "deny": ("post", {**base, "response_type": "id_token", "allow": False}, "access_denied"),
             "invalid resource POST": (
                 "post",
                 {**base, "response_type": "id_token", "resource": "not-a-uri", "allow": True},
+                "invalid_target",
             ),
-            "invalid resource GET": ("get", {**base, "response_type": "id_token", "resource": "not-a-uri"}),
-            "missing response_type": ("get", base),
-            "unknown response_type": ("get", {**base, "response_type": "not-a-type"}),
+            "invalid resource GET": (
+                "get",
+                {**base, "response_type": "id_token", "resource": "not-a-uri"},
+                "invalid_target",
+            ),
         }
-        for name, (method, data) in cases.items():
+        for name, (method, data, error) in cases.items():
             with self.subTest(name):
                 response = getattr(self.client, method)(reverse("oauth2_provider:authorize"), data=data)
-                self.assert_rejected_without_redirect(response)
+                body = self.assert_form_post(response)
+                self.assertIn(f'name="error" value="{error}"', body)
+        # Both errors still name a registered redirect URI, so they are posted back;
+        # an unsupported mode alone is the case that fails fatally in the site.
+        for response_type in (None, "not-a-type"):
+            with self.subTest(response_type=response_type):
+                data = dict(base)
+                if response_type is not None:
+                    data["response_type"] = response_type
+                response = self.client.get(reverse("oauth2_provider:authorize"), data=data)
+                self.assert_form_post(response)
 
-    def test_unsupported_response_mode_rejected_on_prompt_none(self):
+    def test_form_post_response_mode_on_prompt_none(self):
         query_data = {
             "client_id": self.application.client_id,
             "response_type": "id_token",
@@ -618,30 +686,29 @@ class TestImplicitErrorResponseMode(BaseTest):
 
         response = self.client.get(reverse("oauth2_provider:authorize"), data=query_data)
 
-        self.assert_rejected_without_redirect(response)
+        body = self.assert_form_post(response)
+        self.assertIn('name="error" value="login_required"', body)
 
-    def test_unsupported_response_mode_rejected_on_consent_post_with_unknown_response_type(self):
+    def test_unknown_response_mode_rejected_on_consent_post(self):
         """
         oauthlib builds the unsupported_response_type redirect itself on the consent
         POST, so the response mode must be checked before it is called.
         """
         self.client.login(username="test_user", password="123456")
-        for response_mode in ("form_post", "not-a-mode"):
-            with self.subTest(response_mode=response_mode):
-                form_data = {
-                    "client_id": self.application.client_id,
-                    "state": "random_state_string",
-                    "nonce": "random_nonce_string",
-                    "scope": "openid",
-                    "redirect_uri": "http://example.org",
-                    "response_type": "not-a-type",
-                    "response_mode": response_mode,
-                    "allow": True,
-                }
+        form_data = {
+            "client_id": self.application.client_id,
+            "state": "random_state_string",
+            "nonce": "random_nonce_string",
+            "scope": "openid",
+            "redirect_uri": "http://example.org",
+            "response_type": "not-a-type",
+            "response_mode": "not-a-mode",
+            "allow": True,
+        }
 
-                response = self.client.post(reverse("oauth2_provider:authorize"), data=form_data)
+        response = self.client.post(reverse("oauth2_provider:authorize"), data=form_data)
 
-                self.assert_rejected_without_redirect(response)
+        self.assert_rejected_without_redirect(response)
 
     def test_query_response_mode_rejected_on_consent_post(self):
         self.client.login(username="test_user", password="123456")
