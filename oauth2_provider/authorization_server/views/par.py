@@ -6,6 +6,7 @@ from django.views.generic import View
 
 from oauth2_provider.authorization_server import par, stored_requests
 from oauth2_provider.authorization_server.oidc.max_age import INVALID_MAX_AGE_DESCRIPTION, is_valid_max_age
+from oauth2_provider.authorization_server.request_budget import RequestBudgetExceeded
 from oauth2_provider.authorization_server.views.mixins import AuthorizationServerViewMixin
 from oauth2_provider.core.compat import login_not_required
 from oauth2_provider.core.exceptions import OAuthToolkitError
@@ -117,9 +118,22 @@ class PushedAuthorizationRequestView(FormEncodedRequestMixin, AuthorizationServe
         # The request has now been validated in full, as the store requires.
         parameters = par.collect_pushed_parameters(request)
         expires_in = oauth2_settings.PAR_REQUEST_URI_LIFETIME_SECONDS
-        request_uri = stored_requests.store_authorization_request(
-            client.client_id, parameters, expires_in=expires_in
-        )
+        try:
+            request_uri = stored_requests.store_authorization_request(
+                client.client_id,
+                parameters,
+                expires_in=expires_in,
+                max_pending_per_client=oauth2_settings.PAR_MAX_PENDING_REQUESTS_PER_CLIENT,
+            )
+        except RequestBudgetExceeded:
+            # The client holds too many live pushed requests; its expired ones
+            # were already reclaimed during admission, so this is a genuine
+            # overflow. Other clients' stored requests are untouched.
+            return self._error_response(
+                "temporarily_unavailable",
+                "Too many pending pushed authorization requests for this client; retry later.",
+                status=503,
+            )
         return self._json_response({"request_uri": request_uri, "expires_in": expires_in}, status=201)
 
     def _error_from_oauthlib(self, error):

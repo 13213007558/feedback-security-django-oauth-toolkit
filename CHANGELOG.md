@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Per-client capacity control for pushed authorization requests (RFC 9126), via the new
+  `PAR_MAX_PENDING_REQUESTS_PER_CLIENT` setting (default 100, `None` disables). A client may hold
+  at most that many live pushed requests — unconsumed ones plus any whose consumption is under way;
+  expired ones are reclaimed on admission and never count. A push beyond the limit is rejected with
+  `503` `temporarily_unavailable` without evicting any client's valid requests, so one client
+  piling up unconsumed requests can no longer exhaust the temporary storage shared by all clients.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

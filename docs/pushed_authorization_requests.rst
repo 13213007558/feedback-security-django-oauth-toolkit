@@ -55,6 +55,12 @@ Behavior and limitations
   ``PAR_REQUEST_URI_LIFETIME_SECONDS`` (default 60 seconds). A pushed request that is never redeemed
   is removed once it expires by the ``cleartokens`` management command, alongside the other
   short-lived records it clears.
+* **Per-client capacity.** One client may hold at most ``PAR_MAX_PENDING_REQUESTS_PER_CLIENT``
+  (default 100) live pushed requests — stored ones not yet consumed, plus any whose consumption is
+  under way. Expired requests are reclaimed when the client pushes again and never count. A push
+  beyond the limit is rejected with ``503`` and a ``temporarily_unavailable`` error; the rejection
+  evicts nothing, so no other client's valid requests are affected. Set the setting to ``None`` to
+  disable the limit.
 * **Users who are not logged in.** The pushed request's ``prompt`` is in the store, not in the
   query, so when a user who is not logged in follows the ``request_uri``, the authorization
   endpoint consumes it at once. ``prompt=none`` is answered with ``login_required`` at the client's

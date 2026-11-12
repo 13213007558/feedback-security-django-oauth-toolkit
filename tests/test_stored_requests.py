@@ -9,6 +9,7 @@ from datetime import timedelta
 import pytest
 from django.utils import timezone
 
+from oauth2_provider.authorization_server.request_budget import RequestBudgetExceeded
 from oauth2_provider.authorization_server.stored_requests import (
     REQUEST_URI_PREFIX,
     StoredAuthorizationRequestError,
@@ -16,7 +17,7 @@ from oauth2_provider.authorization_server.stored_requests import (
     is_stored_request_uri,
     store_authorization_request,
 )
-from oauth2_provider.models import get_stored_authorization_request_model
+from oauth2_provider.models import create_stored_authorization_request, get_stored_authorization_request_model
 
 
 PARAMETERS = {"client_id": "client", "response_type": "code", "resource": ["https://a", "https://b"]}
@@ -85,3 +86,71 @@ def test_consume_of_an_expired_request_fails_and_removes_it():
     with pytest.raises(StoredAuthorizationRequestError, match="expired"):
         consume_authorization_request(request_uri, "client")
     assert not get_stored_authorization_request_model().objects.filter(request_uri=request_uri).exists()
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_store_enforces_the_per_client_budget():
+    store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=2)
+    store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=2)
+
+    with pytest.raises(RequestBudgetExceeded):
+        store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=2)
+
+    # The rejection evicted nothing: both stored requests are still there.
+    assert get_stored_authorization_request_model().objects.filter(client_id="client").count() == 2
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_store_budget_is_isolated_between_clients():
+    store_authorization_request("flooder", PARAMETERS, expires_in=60, max_pending_per_client=1)
+    with pytest.raises(RequestBudgetExceeded):
+        store_authorization_request("flooder", PARAMETERS, expires_in=60, max_pending_per_client=1)
+
+    # Another client stores against its own budget, undisturbed.
+    request_uri = store_authorization_request("other", PARAMETERS, expires_in=60, max_pending_per_client=1)
+    assert get_stored_authorization_request_model().objects.filter(request_uri=request_uri).exists()
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_store_reclaims_expired_entries_against_the_budget():
+    create_stored_authorization_request(
+        request_uri=f"{REQUEST_URI_PREFIX}expired", client_id="client", parameters=PARAMETERS, expires_in=-10
+    )
+
+    request_uri = store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=1)
+
+    model = get_stored_authorization_request_model()
+    assert not model.objects.filter(request_uri=f"{REQUEST_URI_PREFIX}expired").exists()
+    assert model.objects.filter(request_uri=request_uri).exists()
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_consuming_a_request_frees_the_budget():
+    request_uri = store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=1)
+    with pytest.raises(RequestBudgetExceeded):
+        store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=1)
+
+    assert consume_authorization_request(request_uri, "client") == PARAMETERS
+    store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=1)
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_a_failed_save_consumes_no_budget(mocker):
+    mocker.patch(
+        "oauth2_provider.authorization_server.stored_requests.create_stored_authorization_request",
+        side_effect=RuntimeError("storage unavailable"),
+    )
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=1)
+
+    # The failed store left no row and leaked no budget: a retry succeeds.
+    mocker.stopall()
+    request_uri = store_authorization_request("client", PARAMETERS, expires_in=60, max_pending_per_client=1)
+    assert get_stored_authorization_request_model().objects.filter(request_uri=request_uri).exists()
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_no_budget_by_default():
+    for _ in range(3):
+        store_authorization_request("client", PARAMETERS, expires_in=60)
+    assert get_stored_authorization_request_model().objects.filter(client_id="client").count() == 3

@@ -284,6 +284,74 @@ class TestPAREndpoint(PARBaseTestCase):
         )
 
 
+class TestPARClientBudget(PARBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.oauth2_settings.PAR_MAX_PENDING_REQUESTS_PER_CLIENT = 2
+
+    def push_public(self):
+        data = {
+            "client_id": self.public_application.client_id,
+            "response_type": "code",
+            "redirect_uri": "http://example.org",
+            "scope": "read write",
+            "state": "some_state",
+        }
+        return post_form(self.client, self.par_url, data=data)
+
+    def test_over_budget_push_is_rejected_without_evicting_valid_requests(self):
+        self.assertEqual(self.push().status_code, 201)
+        self.assertEqual(self.push().status_code, 201)
+
+        rejected = self.push()
+        self.assertEqual(rejected.status_code, 503)
+        self.assertEqual(rejected["Cache-Control"], "no-cache, no-store")
+        body = json.loads(rejected.content)
+        self.assertEqual(body["error"], "temporarily_unavailable")
+
+        # The rejection evicted none of the client's valid requests...
+        self.assertEqual(
+            StoredAuthorizationRequest.objects.filter(client_id=self.application.client_id).count(), 2
+        )
+        # ...and other clients push against their own budget, undisturbed.
+        self.assertEqual(self.push_public().status_code, 201)
+
+    def test_consuming_a_pushed_request_frees_the_budget(self):
+        request_uri = json.loads(self.push().content)["request_uri"]
+        self.assertEqual(self.push().status_code, 201)
+        self.assertEqual(self.push().status_code, 503)
+
+        # The normal authorization round trip still works at the budget limit.
+        self.application.skip_authorization = True
+        self.application.save()
+        self.client.login(username="test_user", password="123456")
+        response = self.client.get(
+            self.authorize_url,
+            {"client_id": self.application.client_id, "request_uri": request_uri},
+        )
+        self.assertEqual(response.status_code, 302)
+
+        # The consumed request's slot is free again.
+        self.assertEqual(self.push().status_code, 201)
+
+    def test_expired_pushes_are_reclaimed_against_the_budget(self):
+        self.oauth2_settings.PAR_MAX_PENDING_REQUESTS_PER_CLIENT = 1
+        self.oauth2_settings.PAR_REQUEST_URI_LIFETIME_SECONDS = 0
+
+        # Each push expires at once, so the next admission reclaims it.
+        self.assertEqual(self.push().status_code, 201)
+        self.assertEqual(self.push().status_code, 201)
+        self.assertEqual(
+            StoredAuthorizationRequest.objects.filter(client_id=self.application.client_id).count(), 1
+        )
+
+    def test_no_budget_when_setting_is_none(self):
+        self.oauth2_settings.PAR_MAX_PENDING_REQUESTS_PER_CLIENT = None
+
+        for _ in range(3):
+            self.assertEqual(self.push().status_code, 201)
+
+
 class TestPARPromptNone(PARBaseTestCase):
     def test_pushed_prompt_none_without_consent_is_consent_required(self):
         """prompt=none read from the stored request, not the query string, still

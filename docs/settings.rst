@@ -626,6 +626,17 @@ Default: ``60``
 The lifetime, in seconds, of a ``request_uri`` issued by the PAR endpoint. RFC 9126 §2.2 suggests a
 relatively short value (typically between 5 and 600 seconds).
 
+PAR_MAX_PENDING_REQUESTS_PER_CLIENT
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``100``
+
+How many live pushed requests one client may hold at once. A stored request is live from when it is
+pushed until it is consumed at the authorization endpoint or expires; one whose consumption is under
+way still counts until the consumption finalizes. When a client pushes beyond this limit, its expired
+requests are reclaimed first, and the push is rejected with a ``503`` ``temporarily_unavailable``
+error only if it is still at the limit. The budget is strictly per client: a rejection never evicts
+another client's stored requests. Set to ``None`` to disable the limit.
+
 REQUIRE_PUSHED_AUTHORIZATION_REQUESTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default: ``False``

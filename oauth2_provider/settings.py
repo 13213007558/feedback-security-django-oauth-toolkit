@@ -222,6 +222,9 @@ DEFAULTS = {
     # RFC 9126 Pushed Authorization Requests
     "PAR_ENABLED": True,
     "PAR_REQUEST_URI_LIFETIME_SECONDS": 60,  # RFC 9126 §2.2 suggests 5-600 seconds
+    # Live (unconsumed or in-progress) stored requests one client may hold at
+    # once; None disables the per-client budget.
+    "PAR_MAX_PENDING_REQUESTS_PER_CLIENT": 100,
     "REQUIRE_PUSHED_AUTHORIZATION_REQUESTS": False,
     # RFC 8414 Authorization Server Metadata
     "OAUTH2_RESPONSE_TYPES_SUPPORTED": ["code", "token"],

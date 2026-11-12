@@ -46,10 +46,12 @@ Current producers:
 """
 
 import secrets
+from datetime import datetime
 from typing import Optional
 
 from django.db import transaction
 
+from oauth2_provider.authorization_server.request_budget import ClientRequestBudget
 from oauth2_provider.models import create_stored_authorization_request, get_stored_authorization_request_model
 
 
@@ -78,21 +80,71 @@ def is_stored_request_uri(value: Optional[str]) -> bool:
     return bool(value) and value.startswith(REQUEST_URI_PREFIX)
 
 
-def store_authorization_request(client_id: str, parameters: dict, *, expires_in: int) -> str:
+class DjangoStoredRequestStorage:
+    """The budget's storage operations over the StoredAuthorizationRequest model.
+
+    ``count_live`` locks the client's live rows (``SELECT ... FOR UPDATE``), so
+    it must run inside a transaction; a row locked by a concurrent consumption
+    is an in-progress entry and still counts against the budget until that
+    consumption finalizes. ``reap_expired`` deletes only the calling client's
+    expired rows, so admission never touches another client's entries.
+    """
+
+    def __init__(self, model: type) -> None:
+        self._model = model
+
+    def reap_expired(self, client_id: str, now: datetime) -> int:
+        deleted, _ = self._model.objects.filter(client_id=client_id, expires__lte=now).delete()
+        return deleted
+
+    def count_live(self, client_id: str, now: datetime) -> int:
+        # Evaluate the locked rows rather than COUNT(): several databases
+        # (e.g. PostgreSQL) reject SELECT COUNT(*) ... FOR UPDATE.
+        return len(self._model.objects.select_for_update().filter(client_id=client_id, expires__gt=now))
+
+
+def store_authorization_request(
+    client_id: str,
+    parameters: dict,
+    *,
+    expires_in: int,
+    max_pending_per_client: Optional[int] = None,
+) -> str:
     """Persist a validated authorization request and return its ``request_uri``.
 
     The caller MUST have validated the request in full first; see the module
     docstring for the contract. The ``request_uri`` is bound to ``client_id``,
     expires after ``expires_in`` seconds, and contains a cryptographically strong
     random component so it is infeasible to guess (RFC 9126 §2.2 / §7.1).
+
+    When ``max_pending_per_client`` is not ``None``, admission and the insert
+    run in one transaction under a per-client budget (see
+    :mod:`oauth2_provider.authorization_server.request_budget`): the client's
+    expired entries are reclaimed, and the store is refused with
+    :class:`~oauth2_provider.authorization_server.request_budget.RequestBudgetExceeded`
+    once the client holds that many live (unconsumed or in-progress) entries.
+    The check locks the client's live rows, serializing concurrent stores for
+    the same client; it never touches another client's entries.
     """
     request_uri = REQUEST_URI_PREFIX + secrets.token_urlsafe(32)
-    create_stored_authorization_request(
-        request_uri=request_uri,
-        client_id=client_id,
-        parameters=parameters,
-        expires_in=expires_in,
-    )
+    if max_pending_per_client is None:
+        create_stored_authorization_request(
+            request_uri=request_uri,
+            client_id=client_id,
+            parameters=parameters,
+            expires_in=expires_in,
+        )
+        return request_uri
+    stored_request_model = get_stored_authorization_request_model()
+    with transaction.atomic():
+        budget = ClientRequestBudget(max_pending_per_client)
+        budget.admit(client_id, DjangoStoredRequestStorage(stored_request_model))
+        create_stored_authorization_request(
+            request_uri=request_uri,
+            client_id=client_id,
+            parameters=parameters,
+            expires_in=expires_in,
+        )
     return request_uri
 
 
