@@ -1292,3 +1292,281 @@ class TestDeviceFlowWithSwappedDeviceGrantModel(DeviceFlowBaseTestCase):
             text="Incorrect user code",
             count=1,
         )
+
+
+@pytest.mark.usefixtures("oauth2_settings")
+@pytest.mark.oauth2_settings(presets.DEFAULT_SCOPES_RW)
+class TestDeviceConfirmationStateTransitions(DeviceFlowBaseTestCase):
+    """
+    State-transition tests for the RFC 8628 §3.3 user-interaction and §3.5
+    polling surfaces, driven through the real URLs.
+
+    Unlike the journey tests above, these do not exercise the
+    /device-authorization endpoint (which currently depends on an oauthlib
+    response shape this snapshot does not consume), so every grant here is
+    created directly from fixed test data. Each step checks three things:
+
+    * who the page says it is acting for (the signed-in account),
+    * which DeviceGrant row a write would affect (ownership and state),
+    * what the next /o/token/ poll returns for the device's ``device_code``.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.alice = UserModel.objects.create_user("alice", "alice@example.com", "password123")
+        self.bob = UserModel.objects.create_user("bob", "bob@example.com", "password123")
+        self.oauth2_settings.OAUTH_PRE_TOKEN_VALIDATION = [set_oauthlib_user_to_device_request_user]
+
+    def _grant(self, *, user=None, status=None, expires=None, device_code="test-device-code"):
+        return DeviceModel.objects.create(
+            client_id=self.application.client_id,
+            device_code=device_code,
+            user_code="TEST-CODE",
+            scope="read",
+            expires=expires or datetime.now(tz=timezone.utc) + timedelta(minutes=30),
+            status=status or DeviceModel.AUTHORIZATION_PENDING,
+            user=user,
+        )
+
+    def _confirm_url(self, grant):
+        return reverse(
+            "oauth2_provider:device-confirm",
+            kwargs={"client_id": grant.client_id, "user_code": grant.user_code},
+        )
+
+    def _claim(self, user, grant):
+        self.client.force_login(user)
+        return self.client.post(reverse("oauth2_provider:device"), data={"user_code": grant.user_code})
+
+    def _poll(self, grant, *, client_id=None):
+        response = self.client.post(
+            "/o/token/",
+            data=urlencode(
+                {
+                    "device_code": grant.device_code,
+                    "client_id": client_id or grant.client_id,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                }
+            ),
+            content_type="application/x-www-form-urlencoded",
+        )
+        return response
+
+    def _assert_page_identity(self, response, user, application, scopes_descriptions):
+        assert response.status_code == 200
+        assert response.context["application"] == application
+        assert response.context["scopes_descriptions"] == scopes_descriptions
+        assert response.context["view"].request.user == user
+
+    # ------------------------------------------------------------------
+    # Account switching at the user-code step
+    # ------------------------------------------------------------------
+
+    def test_account_switch_cannot_take_over_a_claimed_grant(self):
+        grant = self._grant()
+
+        response = self._claim(self.alice, grant)
+        assert response.status_code == 302
+        assert response["Location"] == self._confirm_url(grant)
+        grant.refresh_from_db()
+        assert grant.user == self.alice
+
+        # Bob signs in on the shared terminal and enters the same code.
+        response = self._claim(self.bob, grant)
+        assert response.status_code == 200
+        self.assertContains(response, "User code has already been claimed", count=1)
+        grant.refresh_from_db()
+        assert grant.user == self.alice
+
+        # Bob cannot confirm by navigating straight to the URL either.
+        response = self.client.get(self._confirm_url(grant))
+        assert response.status_code == 404
+        response = self.client.post(self._confirm_url(grant), data={"action": "accept"})
+        assert response.status_code == 404
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.AUTHORIZATION_PENDING
+        assert grant.user == self.alice
+
+        # The device still has no token, and polling still says pending.
+        poll = self._poll(grant)
+        assert poll.status_code == 400
+        self.assertJSONEqual(poll.content, {"error": "authorization_pending"})
+
+    def test_confirm_page_is_rendered_for_the_account_that_claimed_the_grant(self):
+        grant = self._grant()
+        self._claim(self.alice, grant)
+
+        response = self.client.get(self._confirm_url(grant))
+        self._assert_page_identity(response, self.alice, self.application, ["Reading scope"])
+        self.assertContains(response, self.application.name)
+
+        grant.refresh_from_db()
+        assert grant.user == self.alice
+        assert grant.status == DeviceModel.AUTHORIZATION_PENDING
+
+    # ------------------------------------------------------------------
+    # Two tabs deciding at the same time
+    # ------------------------------------------------------------------
+
+    def test_second_tab_cannot_overwrite_an_accept_that_already_ended_the_decision(self):
+        grant = self._grant()
+        self._claim(self.alice, grant)
+        confirm_url = self._confirm_url(grant)
+
+        # Both tabs load the confirmation page while the grant is pending.
+        assert self.client.get(confirm_url).status_code == 200
+        assert self.client.get(confirm_url).status_code == 200
+
+        accept = self.client.post(confirm_url, data={"action": "accept"})
+        assert accept.status_code == 302
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.AUTHORIZED
+        assert grant.user == self.alice
+
+        deny = self.client.post(confirm_url, data={"action": "deny"})
+        assert deny.status_code == 404
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.AUTHORIZED
+
+        poll = self._poll(grant)
+        assert poll.status_code == 200
+        token = poll.json()
+        access_token = AccessToken.objects.get(token=token["access_token"])
+        assert access_token.user == self.alice
+        assert access_token.scope == "read"
+        assert token["scope"] == "read"
+
+    def test_second_tab_cannot_overwrite_a_deny_that_already_ended_the_decision(self):
+        grant = self._grant()
+        self._claim(self.alice, grant)
+
+        deny = self.client.post(self._confirm_url(grant), data={"action": "deny"})
+        assert deny.status_code == 302
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.DENIED
+
+        accept = self.client.post(self._confirm_url(grant), data={"action": "accept"})
+        assert accept.status_code == 404
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.DENIED
+
+        poll = self._poll(grant)
+        assert poll.status_code == 400
+        self.assertJSONEqual(poll.content, {"error": "access_denied"})
+        assert not AccessToken.objects.filter(user=self.alice).exists()
+
+    def test_stale_accept_cannot_overwrite_a_deny_committed_after_it_read_the_grant(self):
+        """
+        Simulates the interleaving the conditional UPDATE exists for: tab A
+        reads the grant while it is still pending, tab B commits a deny, then
+        tab A's accept arrives. The stale read must not win.
+        """
+        grant = self._grant(user=self.alice)
+        self.client.force_login(self.alice)
+        confirm_url = self._confirm_url(grant)
+
+        stale = DeviceModel.objects.get(pk=grant.pk)
+        assert stale.status == DeviceModel.AUTHORIZATION_PENDING
+        DeviceModel.objects.filter(pk=grant.pk).update(status=DeviceModel.DENIED)
+
+        with mock.patch.object(
+            oauth2_provider.authorization_server.views.device.DeviceConfirmView,
+            "get_object",
+            return_value=stale,
+        ):
+            response = self.client.post(confirm_url, data={"action": "accept"})
+
+        assert response.status_code == 404
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.DENIED
+        poll = self._poll(grant)
+        assert poll.status_code == 400
+        self.assertJSONEqual(poll.content, {"error": "access_denied"})
+
+    # ------------------------------------------------------------------
+    # Expiry while the confirmation page is open
+    # ------------------------------------------------------------------
+
+    def test_accept_after_the_deadline_cannot_authorize_the_grant(self):
+        grant = self._grant()
+        self._claim(self.alice, grant)
+        confirm_url = self._confirm_url(grant)
+
+        response = self.client.get(confirm_url)
+        self._assert_page_identity(response, self.alice, self.application, ["Reading scope"])
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.AUTHORIZATION_PENDING
+
+        # The deadline passes while the user is looking at the page.
+        DeviceModel.objects.filter(pk=grant.pk).update(
+            expires=datetime.now(tz=timezone.utc) - timedelta(seconds=1)
+        )
+
+        response = self.client.get(confirm_url)
+        assert response.status_code == 404
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.EXPIRED
+        assert grant.user == self.alice
+
+        response = self.client.post(confirm_url, data={"action": "accept"})
+        assert response.status_code == 404
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.EXPIRED
+
+        poll = self._poll(grant)
+        assert poll.status_code == 400
+        self.assertJSONEqual(poll.content, {"error": "expired_token"})
+        assert not AccessToken.objects.filter(user=self.alice).exists()
+
+    def test_expiry_does_not_rewrite_a_decision_committed_before_the_deadline(self):
+        grant = self._grant()
+        self._claim(self.alice, grant)
+
+        response = self.client.post(self._confirm_url(grant), data={"action": "accept"})
+        assert response.status_code == 302
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.AUTHORIZED
+
+        # An old tab is kept open until after the deadline and submits again.
+        DeviceModel.objects.filter(pk=grant.pk).update(
+            expires=datetime.now(tz=timezone.utc) - timedelta(seconds=1)
+        )
+        response = self.client.post(self._confirm_url(grant), data={"action": "deny"})
+        assert response.status_code == 404
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.AUTHORIZED
+
+        poll = self._poll(grant)
+        assert poll.status_code == 400
+        self.assertJSONEqual(poll.content, {"error": "expired_token"})
+
+    # ------------------------------------------------------------------
+    # Polling/redemption identity checks
+    # ------------------------------------------------------------------
+
+    def test_unclaimed_grant_cannot_be_confirmed_or_redeemed(self):
+        grant = self._grant(user=None)
+        self.client.force_login(self.alice)
+        assert self.client.get(self._confirm_url(grant)).status_code == 404
+        assert self.client.post(self._confirm_url(grant), data={"action": "accept"}).status_code == 404
+        grant.refresh_from_db()
+        assert grant.status == DeviceModel.AUTHORIZATION_PENDING
+        assert grant.user_id is None
+
+        poll = self._poll(grant)
+        assert poll.status_code == 400
+        self.assertJSONEqual(poll.content, {"error": "authorization_pending"})
+
+    def test_token_poll_from_a_different_client_is_refused(self):
+        grant = self._grant(user=self.alice, status=DeviceModel.AUTHORIZED)
+        other_application = Application.objects.create(
+            name="other_device_app",
+            user=self.dev_user,
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_DEVICE_CODE,
+        )
+
+        poll = self._poll(grant, client_id=other_application.client_id)
+        assert poll.status_code == 400
+        self.assertJSONEqual(poll.content, {"error": "invalid_grant"})
+        assert not AccessToken.objects.filter(user=self.alice).exists()

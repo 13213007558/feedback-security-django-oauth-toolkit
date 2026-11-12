@@ -694,6 +694,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `client_secret` and `hash_client_secret`.
 
 ### Security
+* The device flow user-interaction step and token exchange now treat the confirmed
+  decision as final (RFC 8628 §3.3 and §3.5). `DeviceUserCodeView` binds a pending grant
+  to the first account that enters its `user_code`; a different signed-in account can no
+  longer re-enter the code and silently take over the device's authorization. The write
+  that claims the grant, and the write that records Accept/Deny, are conditional
+  updates, so two confirmation tabs (or a page left open past the deadline) cannot
+  overwrite a decision that already ended the interaction: the first Accept or Deny
+  wins, and an expired grant cannot be authorized afterwards. The token endpoint now
+  implements oauthlib's `validate_device_code` hook, binding the `device_code` to the
+  authenticated client and deriving the issued token's user and scopes from the stored
+  grant instead of unvalidated request values.
 * #1451 The token introspection endpoint could be called by a caller that had not really
   authenticated, contrary to
   [RFC 7662 section 4](https://datatracker.ietf.org/doc/html/rfc7662#section-4), which requires the

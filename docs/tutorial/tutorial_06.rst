@@ -77,11 +77,22 @@ or Bluetooth, NFC, etc.). In `RFC`_ Figure 1, this is step (C).
 
 Enter the code, and it will redirect you to the device-confirm endpoint. In `RFC`_ Figure 1, this is step (D).
 
+The first account that enters the code claims the grant. If another signed-in account
+enters the same code, or opens the confirmation URL directly, the request is refused
+instead of transferring the device's authorization to that account.
+
 Device-confirm endpoint
 -----------------------
 4. Device polling occurs concurrently while the user approves or denies the request.
 
 .. image:: ../_images/device-approve-deny.png
+
+The first Accept or Deny recorded for a pending grant ends the interaction. A
+confirmation page left open in another tab can no longer change the outcome: the
+second decision, including one that arrives after the grant's deadline, is refused
+and the grant keeps the state it already reached. If the deadline passes while the
+user is still deciding, the grant becomes ``expired`` and the device receives
+``expired_token`` from the token endpoint.
 
 Device polling
 --------------

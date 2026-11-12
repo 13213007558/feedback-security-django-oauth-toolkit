@@ -46,6 +46,7 @@ from .models import (
     AbstractRefreshToken,
     get_access_token_model,
     get_application_model,
+    get_device_grant_model,
     get_grant_model,
     get_id_token_model,
     get_refresh_token_model,
@@ -486,6 +487,43 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         If it exists, it's assigned to request.client.
         """
         return self._load_application(client_id, request) is not None
+
+    def validate_device_code(self, client_id: str, code: str, request, *args, **kwargs) -> str | None:
+        """
+        Report the RFC 8628 §3.5 state of a ``device_code`` polled at the token
+        endpoint.
+
+        The code must belong to the authenticated client and must not have
+        expired. On the authorized path ``request.user`` and ``request.scopes``
+        are taken from the stored grant, so the issued token is bound to the
+        account that approved the grant and carries exactly the scopes the
+        confirmation page showed. Unknown codes, codes from another client,
+        and codes that were never claimed or decided return ``None``, which
+        oauthlib turns into ``invalid_grant``.
+        """
+        grant_model = get_device_grant_model()
+        try:
+            grant = grant_model.objects.get(device_code=code)
+        except grant_model.DoesNotExist:
+            return None
+
+        if grant.client_id != client_id:
+            return None
+
+        if grant.status == grant.DENIED:
+            return "access_denied"
+        if grant.status == grant.EXPIRED:
+            return "expired_token"
+        if grant.expires <= timezone.now():
+            return "expired_token"
+        if grant.status == grant.AUTHORIZATION_PENDING:
+            return "authorization_pending"
+        if grant.status == grant.AUTHORIZED:
+            request.user = grant.user
+            request.scopes = grant.scope.split() if grant.scope else []
+            return "authorized"
+
+        return None
 
     def get_default_redirect_uri(self, client_id, request, *args, **kwargs):
         return request.client.default_redirect_uri

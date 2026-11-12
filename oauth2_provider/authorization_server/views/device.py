@@ -3,8 +3,10 @@ import json
 from django import forms, http
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import ValidationError
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import DetailView, FormView, View
@@ -69,8 +71,27 @@ class DeviceAuthorizationView(FormEncodedRequestMixin, AuthorizationServerViewMi
         return http.JsonResponse(data=response, status=status, headers=headers)
 
 
+def _expire_pending_grant(model, pk: int) -> None:
+    """
+    Move a still-pending grant whose deadline has passed to EXPIRED.
+
+    Conditional so it cannot rewrite a decision another request already
+    recorded: a grant that was authorized or denied before the deadline
+    keeps its terminal state.
+    """
+    model.objects.filter(
+        pk=pk,
+        status=model.AUTHORIZATION_PENDING,
+        expires__lte=timezone.now(),
+    ).update(status=model.EXPIRED)
+
+
 class DeviceGrantForm(forms.Form):
     user_code = forms.CharField(required=True)
+
+    def __init__(self, *args, request_user_id: int | None = None, **kwargs) -> None:
+        self.request_user_id = request_user_id
+        super().__init__(*args, **kwargs)
 
     def clean_user_code(self):
         """
@@ -84,6 +105,8 @@ class DeviceGrantForm(forms.Form):
         * expired_user_code: if the device grant associated with the user_code has expired
         * user_code_already_used: if the device grant associated with the user_code has been already
          approved or denied. The only accepted state of the device grant is AUTHORIZATION_PENDING.
+        * user_code_already_claimed: if the device grant has already been claimed by a different
+         signed-in user at the user-code step.
         """
         cleaned_data = super().clean()
         user_code: str = cleaned_data["user_code"]
@@ -93,12 +116,24 @@ class DeviceGrantForm(forms.Form):
         except device_grant_model.DoesNotExist:
             raise ValidationError("Incorrect user code", code="incorrect_user_code")
 
-        if device_grant.is_expired():
+        if device_grant.status == device_grant.EXPIRED:
             raise ValidationError("Expired user code", code="expired_user_code")
 
         # User of device has already made their decision for this device.
+        # Checked before expiry: an authorized/denied grant stays terminal even
+        # if its deadline has since passed, and must never be rewritten here.
         if device_grant.status != device_grant.AUTHORIZATION_PENDING:
             raise ValidationError("User code has already been used", code="user_code_already_used")
+
+        if device_grant.expires <= timezone.now():
+            _expire_pending_grant(device_grant_model, device_grant.pk)
+            raise ValidationError("Expired user code", code="expired_user_code")
+
+        # A grant is bound to the first account that entered its code. Letting a
+        # different signed-in account re-enter the code would silently transfer the
+        # device's authorization to that account (RFC 8628 §3.3).
+        if device_grant.user_id is not None and device_grant.user_id != self.request_user_id:
+            raise ValidationError("User code has already been claimed", code="user_code_already_claimed")
 
         # Make the device_grant available to the View, saving one additional db call.
         cleaned_data["device_grant"] = device_grant
@@ -120,6 +155,11 @@ class DeviceUserCodeView(LoginRequiredMixin, FormView):
 
     template_name = "oauth2_provider/device/user_code.html"
     form_class = DeviceGrantForm
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs["request_user_id"] = self.request.user.pk
+        return kwargs
 
     def get_success_url(self):
         return reverse(
@@ -144,9 +184,42 @@ class DeviceUserCodeView(LoginRequiredMixin, FormView):
         """
         device_grant: AbstractDeviceGrant = form.cleaned_data["device_grant"]
 
-        device_grant.user = self.request.user
-        device_grant.save(update_fields=["user"])
+        # Claiming is a compare-and-set, not a read-then-write: another tab may
+        # have claimed the grant for a different account, ended the decision, or
+        # the user code may have expired since the form was validated. Only an
+        # unclaimed, still-pending, still-unexpired grant is updated, so a stale
+        # form can never take ownership away from the account that already has it.
+        model = get_device_grant_model()
+        updated = model.objects.filter(
+            pk=device_grant.pk,
+            user__isnull=True,
+            status=model.AUTHORIZATION_PENDING,
+            expires__gt=timezone.now(),
+        ).update(user=self.request.user)
+        if not updated:
+            current = model.objects.filter(pk=device_grant.pk).values("user_id", "status", "expires").first()
+            if current is not None and current["status"] == model.AUTHORIZATION_PENDING:
+                if current["expires"] <= timezone.now():
+                    _expire_pending_grant(model, device_grant.pk)
+                elif current["user_id"] == self.request.user.pk:
+                    # Resubmitting the code in the account that already claimed
+                    # it is a no-op claim; only a claim for another account is
+                    # refused.
+                    self.device_grant = device_grant
+                    return super().form_valid(form)
+            if current is not None and current["user_id"] not in (None, self.request.user.pk):
+                form.add_error(
+                    None,
+                    ValidationError("User code has already been claimed", code="user_code_already_claimed"),
+                )
+            else:
+                form.add_error(
+                    None,
+                    ValidationError("User code has already been used", code="user_code_already_used"),
+                )
+            return self.form_invalid(form)
 
+        device_grant.user = self.request.user
         self.device_grant = device_grant
 
         return super().form_valid(form)
@@ -171,21 +244,32 @@ class DeviceConfirmView(LoginRequiredMixin, FormView):
     def get_object(self):
         """
         Returns the DeviceGrant object in the AUTHORIZATION_PENDING state identified
-        by the slugs client_id and user_code. Raises Http404 if not found.
+        by the slugs client_id and user_code and owned by the signed-in user.
+        Raises Http404 if the grant is missing, owned by someone else, already
+        decided, or past its deadline.
 
         The result is cached on the instance to avoid redundant queries within the
         same request (e.g. get() validates and get_context_data() reads scopes).
+        The POST decision re-reads with a conditional UPDATE; see form_valid().
         """
         if not hasattr(self, "_device_grant"):
             client_id, user_code = self.kwargs.get("client_id"), self.kwargs.get("user_code")
             model = get_device_grant_model()
-            self._device_grant = get_object_or_404(
+            device_grant = get_object_or_404(
                 model,
                 client_id=client_id,
                 user_code=user_code,
-                status=model.AUTHORIZATION_PENDING,
                 user=self.request.user,
             )
+            # A terminal decision stays terminal: never let the expiry check
+            # rewrite an already authorized or denied grant. Only a pending
+            # grant can time out.
+            if device_grant.status != model.AUTHORIZATION_PENDING:
+                raise Http404
+            if device_grant.expires <= timezone.now():
+                _expire_pending_grant(model, device_grant.pk)
+                raise Http404
+            self._device_grant = device_grant
         return self._device_grant
 
     def get_success_url(self):
@@ -208,22 +292,40 @@ class DeviceConfirmView(LoginRequiredMixin, FormView):
 
     def form_valid(self, form):
         """
-        Uses get_object() to retrieves the DeviceGrant object and updates its state
-        to authorized or denied, based on the user input.
+        Records the user's decision with a compare-and-set on the still-pending,
+        still-unexpired grant owned by the signed-in user.
+
+        Two tabs, or a tab left open past the deadline, can race this write.
+        The conditional UPDATE makes the first decision win: a second one can
+        neither flip an already authorized/denied grant nor revive an expired
+        session, so a stale page cannot overwrite a decision that already
+        ended the flow (RFC 8628 §3.3 and §3.5).
         """
         device = self.get_object()
         action = form.cleaned_data["action"]
 
         if action == "accept":
-            device.status = device.AUTHORIZED
-            device.save(update_fields=["status"])
-            return super().form_valid(form)
+            target = device.AUTHORIZED
         elif action == "deny":
-            device.status = device.DENIED
-            device.save(update_fields=["status"])
-            return super().form_valid(form)
+            target = device.DENIED
         else:
             return http.HttpResponseBadRequest()
+
+        model = get_device_grant_model()
+        updated = model.objects.filter(
+            pk=device.pk,
+            user=self.request.user,
+            status=model.AUTHORIZATION_PENDING,
+            expires__gt=timezone.now(),
+        ).update(status=target)
+        if not updated:
+            # Keep the terminal state: if the deadline passed during the
+            # interaction, record EXPIRED; an already-decided grant is untouched.
+            _expire_pending_grant(model, device.pk)
+            raise Http404
+
+        device.status = target
+        return super().form_valid(form)
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
