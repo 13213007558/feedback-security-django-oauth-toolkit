@@ -310,6 +310,14 @@ DEFAULTS = {
     # Resource Server
     # =====================================================================
     # Token introspection (RFC 7662)
+    # Which response members an authorized introspection caller may see. A callable
+    # (or an object with ``can_see_active``/``get_visible_fields``) decides per
+    # caller and per token. The default keeps the pre-policy response; deployments
+    # sharing one endpoint among several resource servers should select a policy
+    # such as ``...introspection_visibility.IntrospectionVisibilityPolicy``.
+    "INTROSPECTION_VISIBILITY_POLICY": (
+        "oauth2_provider.authorization_server.introspection_visibility.AllFieldsPolicy"
+    ),
     "RESOURCE_SERVER_INTROSPECTION_URL": None,
     "RESOURCE_SERVER_AUTH_TOKEN": None,
     "RESOURCE_SERVER_INTROSPECTION_CREDENTIALS": None,
@@ -382,6 +390,7 @@ IMPORT_STRINGS = (
     "REFRESH_TOKEN_ADMIN_CLASS",
     "DCR_REGISTRATION_PERMISSION_CLASSES",
     "RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR",
+    "INTROSPECTION_VISIBILITY_POLICY",
     "REDIRECT_URI_VALIDATOR",
     "ALLOWED_ORIGIN_VALIDATOR",
     "CIMD_METADATA_FETCHER",

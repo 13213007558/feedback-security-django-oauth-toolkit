@@ -285,6 +285,20 @@ A security fix also changes who the token introspection endpoint answers.
 
   See :ref:`introspection-authorization`.
 
+* **Introspection can disclose optional response members per caller.** RFC 7662 section 2.2
+  allows the server to answer differently for different protected resources, and the endpoint
+  now projects an active token's response through ``INTROSPECTION_VISIBILITY_POLICY``. The
+  default, ``AllFieldsPolicy``, keeps the previous fully populated response, so existing
+  deployments need to do nothing. If several resource servers share one introspection endpoint,
+  set the policy to
+  ``"oauth2_provider.authorization_server.introspection_visibility.IntrospectionVisibilityPolicy"``
+  (or a policy of your own, such as ``CallerResourcePolicy``): it still lets every authorized
+  caller learn ``active`` but discloses ``scope``, ``client_id``, ``username``, ``exp`` and
+  ``aud`` only to the application the token was issued to, so one service no longer learns about
+  tokens that belong to another. See :ref:`introspection-visibility`. A policy error answers as
+  though the token were inactive and never falls back to the full response, and the existing
+  authentication and ``can_introspect`` checks still run before it.
+
 3.5 also drops the Django and Python versions that have reached end of life.
 
 * **Django 4.2, 5.0 and 5.1 and Python 3.10 are no longer supported (#1944).** Upgrade to Django

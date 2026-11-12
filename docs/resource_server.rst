@@ -132,6 +132,105 @@ A future release may also add an audience check, requiring the introspecting cli
 audience of the token, as the Red Hat build of Keycloak 26.4.12 does. That is planned as a
 follow-up.
 
+.. _introspection-visibility:
+
+What an introspection caller may see
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RFC 7662 section 2.2 explicitly allows the authorization server to answer differently for
+different protected resources: it "MAY limit which scopes from a given token are returned for
+each protected resource to prevent a protected resource from learning more about the larger
+network than is necessary for its operation". When several resource servers share one
+introspection endpoint, that is what keeps service A from learning about a user token that only
+belongs to service B.
+
+A deployment therefore has two independent decisions for each authorized caller:
+
+* **May the caller learn ``active``?** A resource server usually must, even for a token it may
+  not read details of, so it can reject a token it cannot use. A policy that denies this gets
+  the response of an unknown token, ``{"active": false}``.
+* **May the caller read the optional members?** ``username``, ``scope``, ``aud`` (the RFC 8707
+  resource list), ``client_id`` and ``exp``. These are the fields this endpoint can derive from
+  the stored token.
+
+``INTROSPECTION_VISIBILITY_POLICY`` selects the policy. It is resolved after the endpoint's
+existing checks -- the caller still has to authenticate and its application still has to have
+``can_introspect`` -- so a policy can only narrow the response, never admit a caller. A policy
+error, or a malformed result, is answered as though the token were unknown: it never falls back
+to the full response.
+
+The default, ``AllFieldsPolicy``, keeps the historical response: every authorized caller reads
+every optional member. When resource servers share the endpoint, select
+``IntrospectionVisibilityPolicy`` instead. It still lets every authorized caller learn
+``active``, and discloses the optional members only to the application the token was issued to.
+A second resource server sharing the endpoint therefore gets ``{"active": true}`` and learns
+neither the user, the scopes nor the audience. That keeps the historical response for a client
+validating its own token, which is the common case, while sharing an endpoint safely. (The
+response also never carries optional members for an inactive token: RFC 7662 section 2.2
+requires that an inactive token's answer disclose no additional information.)
+
+Policies are Python callables, classes, or objects with one or more of these methods::
+
+    from oauth2_provider.authorization_server.introspection_visibility import (
+        IntrospectionVisibility,
+    )
+
+    def visibility(context):
+        """Return what this caller may learn about this token."""
+        # context.caller: the authenticated application (never a request parameter)
+        # context.token: the active token being queried
+        if context.caller is context.token.application:
+            return IntrospectionVisibility(
+                allow_active=True,
+                fields={"scope", "client_id", "username", "exp", "aud"},
+            )
+        return IntrospectionVisibility(allow_active=True, fields={"scope"})
+
+    OAUTH2_PROVIDER = {
+        "INTROSPECTION_VISIBILITY_POLICY": visibility,
+    }
+
+``IntrospectionContext`` also offers ``caller_client_id``, ``token_client_id``, ``username``,
+``audiences`` and ``token_is_audience(uri)`` (which uses ``RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR``);
+see the module for the full list. The simpler ``can_see_active(context)`` and
+``get_visible_fields(context)`` methods can be mixed instead.
+
+Two built-in policies cover common deployments:
+
+* ``IntrospectionVisibilityPolicy``, the policy to select when several resource servers share an
+  endpoint, as described above::
+
+      OAUTH2_PROVIDER = {
+          "INTROSPECTION_VISIBILITY_POLICY": (
+              "oauth2_provider.authorization_server.introspection_visibility."
+              "IntrospectionVisibilityPolicy"
+          ),
+      }
+
+* ``CallerResourcePolicy`` maps each caller ``client_id`` to the resource identifiers it speaks
+  for, so a resource server that cannot be recognized from its token's audience still reads
+  tokens bound to its own resources. It matches with
+  ``RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR``, the same rule the resource server uses::
+
+      from oauth2_provider.authorization_server.introspection_visibility import (
+          CallerResourcePolicy,
+      )
+
+      OAUTH2_PROVIDER = {
+          "INTROSPECTION_VISIBILITY_POLICY": CallerResourcePolicy(
+              resources={
+                  "service-a": ["https://a.example.com"],
+                  "service-b": ["https://b.example.com"],
+              },
+          ),
+      }
+
+  A caller with no entry learns ``active`` only, and ``deny_active`` names callers that should
+  not even learn that.
+
+Never build a policy from a request parameter such as the body's ``client_id``: those are
+caller-supplied. The context's ``caller`` is the application the endpoint authenticated, so a
+caller cannot claim to be someone else to widen its view.
+
 .. _introspection-open-registration:
 
 Introspection when registration is open

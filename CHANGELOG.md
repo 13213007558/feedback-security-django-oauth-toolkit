@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Caller-specific token introspection visibility: the new `INTROSPECTION_VISIBILITY_POLICY` setting
+  decides, per authenticated caller and per token, whether it may learn `active` and which optional
+  RFC 7662 §2.2 members it may read (`scope`, `client_id`, `username`, `exp`, `aud`). RFC 7662
+  explicitly allows answering differently for different protected resources, so several resource
+  servers can share one introspection endpoint without one learning about another's tokens.
+  `AllFieldsPolicy` (the default) keeps the previous response, `IntrospectionVisibilityPolicy`
+  discloses details only to the token's own application, and `CallerResourcePolicy` maps callers to
+  resource identifiers. A policy is consulted only after the existing authentication and
+  `can_introspect` checks, can only narrow what a caller sees, and an error in it answers as though
+  the token were inactive instead of falling back to the full response.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

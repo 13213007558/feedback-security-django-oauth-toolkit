@@ -1111,6 +1111,26 @@ The default is to delete the tokens of all applications if this flag is enabled.
 Resource Server settings
 ------------------------
 
+INTROSPECTION_VISIBILITY_POLICY
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``"oauth2_provider.authorization_server.introspection_visibility.AllFieldsPolicy"``
+
+Decides which members an *already authorized* caller may read from an active token
+introspection response (RFC 7662 section 2.2, which explicitly allows the server to
+answer differently for different protected resources). The default keeps the
+pre-policy response: every authorized caller reads every member. Deployments whose
+resource servers share one endpoint should select a narrower policy, such as the
+built-in ``IntrospectionVisibilityPolicy``.
+
+The endpoint still authenticates the caller and checks ``can_introspect`` exactly as
+before; the policy is consulted afterwards, so it can only narrow what the caller
+sees. A policy error discloses nothing, never everything.
+
+A policy is a callable, a class, or an object with one or more of
+``get_visibility(context)``, ``can_see_active(context)`` and
+``get_visible_fields(context)``. See :ref:`introspection-visibility` for the shape
+of the context, the built-in policies and their behavior.
+
 RESOURCE_SERVER_INTROSPECTION_URL
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The introspection endpoint for validating token remotely (RFC7662). This URL requires an

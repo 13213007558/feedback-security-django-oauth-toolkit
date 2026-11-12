@@ -52,6 +52,33 @@ REST_FRAMEWORK_SCOPES = {
         "resource1": "Resource 1",
     },
 }
+INTROSPECTION_VISIBILITY_SETTINGS = {
+    "SCOPES": {
+        "read": "Read scope",
+        "write": "Write scope",
+        "introspection": "Introspection scope",
+        "dolphin": "eek eek eek scope",
+    },
+    "RESOURCE_SERVER_INTROSPECTION_URL": "http://example.org/introspection",
+    "READ_SCOPE": "read",
+    "WRITE_SCOPE": "write",
+}
+
+# The restrictive built-in policy for endpoints shared by several resource servers.
+INTROSPECTION_RESTRICTED_SETTINGS = {
+    "SCOPES": {
+        "read": "Read scope",
+        "write": "Write scope",
+        "introspection": "Introspection scope",
+        "dolphin": "eek eek eek scope",
+    },
+    "RESOURCE_SERVER_INTROSPECTION_URL": "http://example.org/introspection",
+    "READ_SCOPE": "read",
+    "WRITE_SCOPE": "write",
+    "INTROSPECTION_VISIBILITY_POLICY": (
+        "oauth2_provider.authorization_server.introspection_visibility.IntrospectionVisibilityPolicy"
+    ),
+}
 INTROSPECTION_SETTINGS = {
     "SCOPES": {
         "read": "Read scope",
@@ -62,6 +89,10 @@ INTROSPECTION_SETTINGS = {
     "RESOURCE_SERVER_INTROSPECTION_URL": "http://example.org/introspection",
     "READ_SCOPE": "read",
     "WRITE_SCOPE": "write",
+    # The endpoint's historical, fully populated response, now an explicit opt-in.
+    "INTROSPECTION_VISIBILITY_POLICY": (
+        "oauth2_provider.authorization_server.introspection_visibility.AllFieldsPolicy"
+    ),
 }
 
 ALLOWED_SCHEMES_DEFAULT = {

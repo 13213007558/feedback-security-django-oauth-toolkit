@@ -12,6 +12,13 @@ from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 from oauthlib.common import Request as OauthlibRequest
 
+from oauth2_provider.authorization_server.introspection_visibility import (
+    HIDDEN,
+    IntrospectionContext,
+    IntrospectionVisibility,
+    evaluate_visibility,
+    resolve_visibility_policy,
+)
 from oauth2_provider.core.backends_oauthlib import _AUTHENTICATED_CLIENT_ATTRIBUTE
 from oauth2_provider.core.compat import login_not_required
 from oauth2_provider.core.views import FormEncodedRequestMixin
@@ -24,6 +31,12 @@ log = logging.getLogger(__name__)
 # Stored under _AUTHENTICATED_CLIENT_ATTRIBUTE before the backend runs: still there
 # afterwards means the backend did not report which client it authenticated.
 _NOT_REPORTED = object()
+
+# The application that authorized this introspection request, recorded by
+# ``authenticate_client()`` or ``verify_request()`` only after their checks pass.
+# The visibility policy reads it, never a request parameter, so a caller cannot
+# name another client in the body or query string and change what it sees.
+_INTROSPECTION_CALLER_ATTRIBUTE = "_oauth2_provider_introspection_caller"
 
 # The backend classes already warned about, so that a backend which cannot report
 # the authenticated client is logged once per process rather than on every
@@ -146,6 +159,7 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
                 getattr(client, "client_id", None),
             )
             return False
+        setattr(request, _INTROSPECTION_CALLER_ATTRIBUTE, client)
         return True
 
     def verify_request(self, request: HttpRequest) -> tuple[bool, OauthlibRequest | None]:
@@ -189,10 +203,26 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
                 ]
             )
             return False, oauthlib_request
+        setattr(request, _INTROSPECTION_CALLER_ATTRIBUTE, application)
         return valid, oauthlib_request
 
-    @staticmethod
-    def get_token_response(token_value=None):
+    def get_token_response(self, token_value=None):
+        """Answer an introspection request whose caller has already been authorized.
+
+        *token_value* is the token to look up. The response for an active token is
+        projected through the configured visibility policy, keyed on the caller that
+        ``authenticate_client()`` or ``verify_request()`` recorded for this request
+        and on the token itself. The policy decides whether the caller may learn the
+        token is active and which optional members it may read (RFC 7662 section
+        2.2). It is consulted only after the caller passed the authentication and
+        ``can_introspect`` checks, so it can only narrow -- never widen -- what the
+        caller sees.
+
+        A policy error discloses nothing, not even that the token exists: the
+        response is the same one an inactive or unknown token gets. An inactive
+        token is likewise always answered with a bare ``active: false``, because
+        RFC 7662 section 2.2 forbids additional information about one.
+        """
         if token_value is None:
             return JsonResponse(
                 {"error": "invalid_request", "error_description": "Token parameter is missing."},
@@ -206,27 +236,72 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
                 .get(token_checksum=token_checksum)
             )
         except ObjectDoesNotExist:
-            return JsonResponse({"active": False}, status=200)
+            return self._inactive_response()
+        if not token.is_valid():
+            return self._inactive_response()
+
+        caller = getattr(self, "_introspection_caller", None)
+        if not isinstance(caller, AbstractApplication):
+            # ``get()``/``post()`` record the caller before dispatching here. A
+            # subclass that calls this method directly, or overrides the
+            # authentication checks, has no caller to project for, so it discloses
+            # nothing: never fall back to the full response.
+            log.warning(
+                "Introspection response not projected: no authenticated caller was recorded "
+                "for this request; answering as though the token were inactive"
+            )
+            return self._inactive_response()
+
+        # Resolving the setting is part of applying the policy: an import-string
+        # that no longer resolves is a policy error, not a 500 that would also
+        # disclose that the token exists.
+        policy, error = _resolve_policy()
+        if error is None:
+            visibility, error = evaluate_visibility(policy, IntrospectionContext(caller=caller, token=token))
         else:
-            if token.is_valid():
-                data = {
-                    "active": True,
-                    "scope": token.scope,
-                    "exp": int(calendar.timegm(token.expires.timetuple())),
-                }
-                if token.application:
-                    data["client_id"] = token.application.client_id
-                if token.user:
-                    data["username"] = token.user.get_username()
+            visibility = HIDDEN
+        if error is not None:
+            # RFC 7662 section 2.2 again: disclose nothing rather than everything.
+            # Log the policy and exception type only: a policy may raise with a
+            # message that includes the token, which is a credential, and a
+            # traceback would echo it too.
+            log.warning(
+                "Introspection visibility policy %s failed; answering as though the token "
+                "were inactive: %s",
+                _describe_policy(policy),
+                type(error).__name__,
+            )
+            return self._inactive_response()
+        if not visibility.allow_active:
+            return self._inactive_response()
 
-                # RFC 8707: Include audience list if token has resource binding
-                audiences = token.resource
-                if audiences:
-                    data["aud"] = audiences
+        return JsonResponse(self._token_data(token, visibility))
 
-                return JsonResponse(data)
-            else:
-                return JsonResponse({"active": False}, status=200)
+    @staticmethod
+    def _inactive_response() -> JsonResponse:
+        return JsonResponse({"active": False}, status=200)
+
+    @staticmethod
+    def _token_data(token, visibility: IntrospectionVisibility) -> dict:
+        """Build the active response for *token*, restricted to *visibility*.
+
+        ``exp`` and ``aud`` are derived only when selected, so a policy that does
+        not allow them does not even trigger the database/formatting work. The
+        values are the token's own: ``username`` and ``client_id`` appear only
+        when the token has the corresponding user or application.
+        """
+        data: dict[str, object] = {"active": True}
+        if "scope" in visibility.fields:
+            data["scope"] = token.scope
+        if "client_id" in visibility.fields and token.application:
+            data["client_id"] = token.application.client_id
+        if "username" in visibility.fields and token.user:
+            data["username"] = token.user.get_username()
+        if "exp" in visibility.fields:
+            data["exp"] = int(calendar.timegm(token.expires.timetuple()))
+        if "aud" in visibility.fields and token.resource:
+            data["aud"] = token.resource
+        return data
 
     def get(self, request, *args, **kwargs):
         """
@@ -238,6 +313,7 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
         :param kwargs:
         :return:
         """
+        self._record_caller(request)
         return self.get_token_response(request.GET.get("token", None))
 
     def post(self, request, *args, **kwargs):
@@ -250,4 +326,35 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
         :param kwargs:
         :return:
         """
+        self._record_caller(request)
         return self.get_token_response(request.POST.get("token", None))
+
+    def _record_caller(self, request: HttpRequest) -> None:
+        """Copy the caller this request authorized onto the view for projection."""
+        self._introspection_caller = getattr(request, _INTROSPECTION_CALLER_ATTRIBUTE, None)
+
+
+def _resolve_policy() -> tuple[object, Exception | None]:
+    """Resolve ``INTROSPECTION_VISIBILITY_POLICY`` without letting an error escape.
+
+    An import string that does not resolve is a deployment mistake, but it must not
+    turn into a 500 that reveals the token exists: the caller answers as though the
+    policy had failed. Returns the policy (or ``None``) and the error, if any.
+    """
+    try:
+        return resolve_visibility_policy(), None
+    except Exception as exc:
+        return None, exc
+
+
+def _describe_policy(policy: object) -> str:
+    """A loggable description of *policy*, without rendering the object itself."""
+    if policy is None:
+        # Resolution of the configured import string failed, so there is no policy
+        # object to name; the exception type in the log line says why.
+        return "INTROSPECTION_VISIBILITY_POLICY"
+    name = getattr(policy, "__qualname__", None) or getattr(policy, "__name__", None)
+    module = getattr(policy, "__module__", None)
+    if name and module:
+        return f"{module}.{name}"
+    return name or type(policy).__name__
