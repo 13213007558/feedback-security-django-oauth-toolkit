@@ -1010,6 +1010,8 @@ class AbstractGrant(models.Model):
     * :attr:`code_challenge` PKCE code challenge
     * :attr:`code_challenge_method` PKCE code challenge transform algorithm
     * :attr:`resource` RFC 8707 resource indicator(s), JSON-encoded array of URIs
+    * :attr:`consent_version` The version of the data-usage terms the resource
+      owner consented to when this code was issued
     """
 
     CODE_CHALLENGE_PLAIN = "plain"
@@ -1055,6 +1057,13 @@ class AbstractGrant(models.Model):
     claims = models.TextField(blank=True, verbose_name=_("claims"))
 
     resource = ResourceJSONField(blank=True, default=list, verbose_name=_("resource"))
+
+    # The data-usage terms version this consent was given against. Signed into
+    # the authorization form and copied from it, so it is the version the
+    # resource owner actually saw, never the version served at submit time.
+    consent_version = models.CharField(
+        max_length=255, blank=True, default="", verbose_name=_("consent version")
+    )
 
     def is_expired(self):
         """
@@ -1108,6 +1117,8 @@ class AbstractAccessToken(models.Model):
     * :attr:`scope` Allowed scopes
     * :attr:`resource` RFC 8707 resource indicator(s) - JSON-encoded array of URIs
     * :attr:`claims` The OIDC ``claims`` request (Core 5.5) the token was issued for
+    * :attr:`consent_version` The data-usage terms version the consent behind
+      this token was given against
     """
 
     id = models.BigAutoField(primary_key=True)
@@ -1159,6 +1170,12 @@ class AbstractAccessToken(models.Model):
     # The normalized OIDC claims request (Core 5.5) behind this token, so the UserInfo
     # endpoint and a refresh know which individual claims were requested.
     claims = ClaimsRequestJSONField(blank=True, default=dict, verbose_name=_("claims"))
+    # The data-usage terms version the consent behind this token was given
+    # against: copied from the grant at code exchange (or from the signed form
+    # for implicit/hybrid) and preserved across refreshes.
+    consent_version = models.CharField(
+        max_length=255, blank=True, default="", verbose_name=_("consent version")
+    )
 
     created = models.DateTimeField(auto_now_add=True, verbose_name=_("created"))
     updated = models.DateTimeField(auto_now=True, verbose_name=_("updated"))
@@ -1265,6 +1282,8 @@ class AbstractRefreshToken(models.Model):
                            bounded to
     * :attr:`revoked` Timestamp of when this refresh token was revoked
     * :attr:`resource` RFC 8707 resource indicator(s), JSON-encoded array of URIs
+    * :attr:`consent_version` The data-usage terms version the consent behind
+      this refresh chain was given against
     """
 
     id = models.BigAutoField(primary_key=True)
@@ -1302,6 +1321,13 @@ class AbstractRefreshToken(models.Model):
     token_family = models.UUIDField(null=True, blank=True, editable=False, verbose_name=_("token family"))
 
     resource = ResourceJSONField(blank=True, default=list, verbose_name=_("resource"))
+
+    # Pins the whole refresh chain to the data-usage terms version consented at
+    # authorization time. Rotation copies it, so a refreshed token can never
+    # exercise a version the resource owner did not agree to.
+    consent_version = models.CharField(
+        max_length=255, blank=True, default="", verbose_name=_("consent version")
+    )
 
     created = models.DateTimeField(auto_now_add=True, verbose_name=_("created"))
     updated = models.DateTimeField(auto_now=True, verbose_name=_("updated"))
@@ -1538,6 +1564,12 @@ class AbstractDeviceGrant(models.Model):
     )
     client_id = models.CharField(max_length=100, db_index=True, verbose_name=_("client ID"))
     last_checked = models.DateTimeField(auto_now=True, verbose_name=_("last checked"))
+    # The data-usage terms version the resource owner consented to when
+    # approving this device; empty when the device was authorized before
+    # consent versioning was configured, or without an interactive consent.
+    consent_version = models.CharField(
+        max_length=255, blank=True, default="", verbose_name=_("consent version")
+    )
 
     def is_expired(self):
         """

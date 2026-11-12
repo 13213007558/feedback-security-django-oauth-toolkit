@@ -652,6 +652,84 @@ set ``skip_authorization = True`` on the ``Application`` model, either programma
 Django admin. Users will *not* be prompted for authorization, even on the first use of the application.
 
 
+.. _consent-versioning:
+
+Versioned data-usage consent
+============================
+
+A resource owner consents to a particular *version* of the data-usage terms, not to an abstract
+application. If the backend changes the terms while a consent page is open, the submitted consent must
+still be recorded against the version that was actually displayed, and a version change must never
+silently widen what an existing token may do. django-oauth-toolkit pins every grant and token to the
+consent version it was created from.
+
+The consent backend
+~~~~~~~~~~~~~~~~~~~
+
+Configure ``CONSENT_BACKEND_CLASS`` with a subclass of
+``oauth2_provider.authorization_server.consent.BaseConsentBackend`` implementing two methods:
+
+* ``get_consent_version(request, application=None)`` returns the opaque identifier of the terms version
+  the consent page must currently display (any non-empty string that stays stable for an unchanged
+  document and changes when the document changes).
+* ``is_consent_valid(consented_version, current_version, request=None, application=None)`` reports whether
+  a consent recorded under ``consented_version`` still covers a request made while
+  ``get_consent_version`` returns ``current_version``. Returning ``False`` makes the authorization
+  endpoint show the consent page again (or answer ``consent_required`` to a ``prompt=none`` request)
+  and, when ``CONSENT_VERSION_ENFORCE_ON_REFRESH`` is enabled, rejects the refresh at the token endpoint.
+
+The shipped ``StaticConsentBackend`` returns the empty version and never invalidates, which keeps the
+feature dormant until it is configured:
+
+.. code-block:: python
+
+    from oauth2_provider.authorization_server.consent import BaseConsentBackend
+
+    class TermsVersionBackend(BaseConsentBackend):
+        def get_consent_version(self, request, application=None):
+            return Terms.objects.current().version  # e.g. "2026-11"
+
+        def is_consent_valid(self, consented_version, current_version, request=None, application=None):
+            # An exact-match policy: any terms change requires a fresh consent, so a
+            # new version can never extend the scope of a previously issued token.
+            return consented_version == current_version
+
+.. code-block:: python
+
+    # settings.py
+    OAUTH2_PROVIDER = {
+        "CONSENT_BACKEND_CLASS": "myproject.oauth.TermsVersionBackend",
+        "CONSENT_VERSION_ENFORCE_ON_REFRESH": True,
+    }
+
+How the version travels
+~~~~~~~~~~~~~~~~~~~~~~~
+
+#. The authorization endpoint renders the current version on the consent page and signs it into a hidden
+   form field, alongside the device-confirmation page for the device flow.
+#. On submit the signature is verified. If the terms changed between rendering the page and receiving the
+   submission (a second tab, a deploy), the stale consent is refused with no grant written, and the page is
+   re-rendered against the current version for a fresh, explicit consent. A tampered or unsigned field is
+   rejected outright.
+#. The verified version is stored on the ``Grant`` (``consent_version``) and, for the implicit and hybrid
+   flows that mint tokens directly, on the access token. The device flow stores it on the ``DeviceGrant``.
+#. The token endpoint copies the grant's version onto the access and refresh tokens for a code exchange,
+   the device grant's version onto the device-flow tokens, and a refresh preserves the version across the
+   whole refresh-token chain, including rotation.
+
+Every access token, refresh token, grant and device grant therefore answers *which consent it exercises*
+without trusting the version the backend serves later. The values are visible (and searchable) in the
+Django admin for the grant, access-token and refresh-token models.
+
+Refresh invalidation
+~~~~~~~~~~~~~~~~~~~~
+
+With ``CONSENT_VERSION_ENFORCE_ON_REFRESH`` enabled, presenting a refresh token whose recorded version the
+backend no longer accepts returns an OAuth 2.0 ``invalid_grant`` error: the client must send the resource
+owner through authorization again. Existing access tokens are not deleted; they simply expire, and no new
+tokens are minted under a consent the resource owner never gave. With the setting disabled (the default),
+refreshes continue to work and each new token keeps the original, recorded version.
+
 .. _override-views:
 
 Overriding views

@@ -30,6 +30,11 @@ env = environ.FileAwareEnv(
     OAUTH2_PROVIDER_OIDC_RP_INITIATED_LOGOUT_ENABLED=(bool, True),
     OAUTH2_PROVIDER_DCR_ENABLED=(bool, True),
     OAUTH2_PROVIDER_CIMD_ENABLED=(bool, False),
+    # Data-usage terms version. Empty keeps consent versioning dormant; set a value
+    # (and bump it when the terms change) to pin every grant and token to the version
+    # the resource owner actually consented to. See idp.oauth.DemoConsentBackend.
+    OAUTH2_PROVIDER_CONSENT_VERSION=(str, ""),
+    OAUTH2_PROVIDER_CONSENT_VERSION_ENFORCE_ON_REFRESH=(bool, False),
     # Return the profile/email/address/phone scope claims from UserInfo rather than the
     # ID Token when an access token is issued (OIDC Core §5.4). On by default in the demo;
     # set to false to exercise the library's legacy default.
@@ -293,8 +298,16 @@ def pkce_required(client_id):
     return _pkce_required_default
 
 
+# Read by idp.oauth.DemoConsentBackend through django.conf.settings.
+OAUTH2_PROVIDER_CONSENT_VERSION = env("OAUTH2_PROVIDER_CONSENT_VERSION")
+
+
 OAUTH2_PROVIDER = {
     "OAUTH2_VALIDATOR_CLASS": "idp.oauth.CustomOAuth2Validator",
+    "CONSENT_BACKEND_CLASS": "idp.oauth.DemoConsentBackend",
+    "CONSENT_VERSION_ENFORCE_ON_REFRESH": env(
+        "OAUTH2_PROVIDER_CONSENT_VERSION_ENFORCE_ON_REFRESH"
+    ),
     "OAUTH_DEVICE_VERIFICATION_URI": "http://127.0.0.1:8000/o/device",
     "OAUTH_PRE_TOKEN_VALIDATION": [set_oauthlib_user_to_device_request_user],
     "OAUTH_DEVICE_USER_CODE_GENERATOR": user_code_generator,

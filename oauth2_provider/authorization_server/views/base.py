@@ -33,6 +33,7 @@ from oauthlib.openid.connect.core.exceptions import (
 )
 
 from oauth2_provider.authorization_server import par, stored_requests
+from oauth2_provider.authorization_server.consent import get_consent_backend
 from oauth2_provider.authorization_server.forms import AllowForm
 from oauth2_provider.authorization_server.oidc import request_objects
 from oauth2_provider.authorization_server.oidc.claims import (
@@ -72,6 +73,10 @@ log = logging.getLogger("oauth2_provider")
 REAUTHENTICATION_SESSION_KEY = "_oauth2_provider_reauthentication"
 REAUTHENTICATION_WINDOW_SECONDS = 300
 REAUTHENTICATION_RECORD_LIMIT = 10
+
+# Salt for the data-usage terms version signed onto the consent form. The
+# signature binds a POST to the exact version rendered on the GET.
+CONSENT_VERSION_SALT = "oauth2_provider.consent_version"
 
 
 # login_not_required decorator to bypass LoginRequiredMiddleware
@@ -149,6 +154,33 @@ class AuthorizationView(BaseAuthorizationView, FormView):
 
     skip_authorization_completely = False
 
+    @staticmethod
+    def _sign_consent_version(consent_version: str) -> str:
+        """Sign the data-usage terms version shown on the consent page."""
+        return signing.dumps(consent_version or "", salt=CONSENT_VERSION_SALT)
+
+    @classmethod
+    def _consented_version(cls, form: AllowForm) -> tuple[str, bool]:
+        """
+        Return ``(version, ok)`` for the consent the form submits.
+
+        The hidden field carries the version rendered on the GET, signed so it
+        cannot be forged or replayed against another version. A form without a
+        signed field (a custom template that predates consent versioning, or a
+        tampered POST) yields ``("", False)``: only the empty version the
+        default backend serves may go through unsigned, and nothing else may.
+        """
+        signed = form.cleaned_data.get("consent_version") or ""
+        if not signed:
+            return "", True
+        try:
+            version = signing.loads(signed, salt=CONSENT_VERSION_SALT)
+        except signing.BadSignature:
+            return "", False
+        if not isinstance(version, str):
+            return "", False
+        return version, True
+
     def get_initial(self):
         # TODO: move this scopes conversion from and to string into a utils function
         scopes = self.oauth2_data.get("scope", self.oauth2_data.get("scopes", []))
@@ -166,6 +198,7 @@ class AuthorizationView(BaseAuthorizationView, FormView):
             "claims_request": self.oauth2_data.get("claims_request", None),
             "acr_values": self.oauth2_data.get("acr_values", None),
             "resource": self.oauth2_data.get("resource", None),  # RFC 8707
+            "consent_version": self.oauth2_data.get("consent_version_signed", ""),
         }
         return initial_data
 
@@ -245,6 +278,28 @@ class AuthorizationView(BaseAuthorizationView, FormView):
 
         scopes = form.cleaned_data.get("scope")
         allow = form.cleaned_data.get("allow")
+
+        consent_version, version_ok = self._consented_version(form)
+        if not version_ok:
+            # The signed field was tampered with or signed for another terms
+            # version: refuse rather than recording a consent whose version
+            # cannot be established.
+            return self._fatal_invalid_request(
+                "The data-usage terms version on the consent form could not be verified. "
+                "Reload the authorization page and review the current terms before authorizing."
+            )
+        if allow:
+            current_version = get_consent_backend().get_consent_version(self.request, application)
+            if current_version and not get_consent_backend().is_consent_valid(
+                consent_version, current_version, self.request, application
+            ):
+                # The terms changed after this page was rendered (another tab, a
+                # backend change). Re-render with the current version instead of
+                # recording the old consent against the new terms.
+                return self._reload_consent_page(form, current_version)
+            # The grant and any tokens created directly (implicit/hybrid) carry
+            # the version that was actually shown and agreed to.
+            credentials["consent_version"] = consent_version
 
         try:
             uri, headers, body, status = self.create_authorization_response(
@@ -373,6 +428,52 @@ class AuthorizationView(BaseAuthorizationView, FormView):
         """
         error = FatalClientError(error=CustomOAuth2Error(error="invalid_request", description=description))
         return self.error_response(error, application=None)
+
+    def _reload_consent_page(self, form: AllowForm, consent_version: str) -> http.HttpResponse:
+        """
+        Re-render the consent page for the current data-usage terms version.
+
+        The submitted consent referred to a version that is no longer valid (the
+        terms changed while the page was open), so it cannot be recorded. The
+        form is rebuilt with the current, freshly signed version while the
+        authorization request's own parameters are taken from the submitted
+        (hidden) fields; the resource owner resubmits against the terms they
+        now see.
+        """
+        # A POST view has no GET oauth2_data to render from: repopulate it from
+        # the hidden fields the form carried, replacing only the stale consent
+        # version. get_initial() renders the hidden inputs from oauth2_data.
+        self.oauth2_data = {
+            "redirect_uri": form.cleaned_data.get("redirect_uri"),
+            "scope": form.cleaned_data.get("scope", "").split(),
+            "nonce": form.cleaned_data.get("nonce"),
+            "client_id": form.cleaned_data.get("client_id"),
+            "state": form.cleaned_data.get("state"),
+            "response_type": form.cleaned_data.get("response_type"),
+            "response_mode": form.cleaned_data.get("response_mode"),
+            "code_challenge": form.cleaned_data.get("code_challenge"),
+            "code_challenge_method": form.cleaned_data.get("code_challenge_method"),
+            "claims": form.cleaned_data.get("claims"),
+            "claims_request": form.cleaned_data.get("claims_request"),
+            "acr_values": form.cleaned_data.get("acr_values"),
+            "resource": form.cleaned_data.get("resource"),
+            "consent_version": consent_version,
+            "consent_version_signed": self._sign_consent_version(consent_version),
+        }
+        application = get_application_model().objects.get(client_id=self.oauth2_data["client_id"])
+        all_scopes = get_scopes_backend().get_all_scopes()
+        scopes = self.oauth2_data["scope"]
+        # An unbound form repopulates its hidden inputs from get_initial();
+        # a bound one would keep the stale submitted values.
+        fresh_form = self.get_form(self.get_form_class())
+        context = self.get_context_data(
+            form=fresh_form,
+            application=application,
+            scopes=scopes,
+            scopes_descriptions=[all_scopes.get(scope, scope) for scope in scopes],
+            **self.oauth2_data,
+        )
+        return self.render_to_response(context)
 
     def _resolve_stored_request_uri(
         self, request: http.HttpRequest, request_uri: str
@@ -770,6 +871,17 @@ class AuthorizationView(BaseAuthorizationView, FormView):
         # TODO: Cache this!
         application = get_application_model().objects.get(client_id=credentials["client_id"])
 
+        # The data-usage terms version this page will display. It is signed into
+        # the form, so whatever the backend serves later cannot replace what the
+        # resource owner actually reviews here.
+        consent_backend = get_consent_backend()
+        consent_version = consent_backend.get_consent_version(request, application)
+        kwargs["consent_version"] = consent_version
+        kwargs["consent_version_signed"] = self._sign_consent_version(consent_version)
+        # Tokens minted without an interactive form (skip_authorization) take
+        # the version currently in force.
+        credentials["consent_version"] = consent_version
+
         kwargs["application"] = application
         kwargs["client_id"] = credentials["client_id"]
         kwargs["redirect_uri"] = credentials["redirect_uri"]
@@ -874,6 +986,7 @@ class AuthorizationView(BaseAuthorizationView, FormView):
                         token.allow_scopes(scopes)
                         and requested_claims <= requested_claim_names(token.claims)
                         and (not resources_checked or self._resources_covered(credentials, token.resource))
+                        and self._token_consent_current(token, consent_backend, consent_version, application)
                     ):
                         uri, headers, body, status = self.create_authorization_response(
                             request=self.request,
@@ -916,6 +1029,22 @@ class AuthorizationView(BaseAuthorizationView, FormView):
         if not requested:
             return not granted
         return requested <= set(granted)
+
+    def _token_consent_current(
+        self, token, consent_backend, current_version: str, application: "AbstractApplication"
+    ) -> bool:
+        """Whether ``token``'s recorded consent still covers the current terms.
+
+        A token predating consent versioning (an empty recorded version) is
+        accepted only when the backend serves no version either, so enabling
+        versioning forces a fresh consent instead of treating legacy tokens as
+        agreement to the new terms.
+        """
+        if not current_version:
+            return not token.consent_version
+        return consent_backend.is_consent_valid(
+            token.consent_version, current_version, self.request, application
+        )
 
     def handle_prompt_login(self) -> HttpResponse:
         return self._redirect_to_login()

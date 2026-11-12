@@ -89,11 +89,11 @@ class ApplicationAdmin(admin.ModelAdmin):
 
 
 class AccessTokenAdmin(admin.ModelAdmin):
-    list_display = ("pk", "masked_token", "user", "application", "expires")
+    list_display = ("pk", "masked_token", "user", "application", "expires", "consent_version")
     list_select_related = ("application", "user")
     raw_id_fields = ("user", "source_refresh_token")
     # Search by non-secret identifiers only; never by the token itself.
-    search_fields = ("application__client_id", "application__name") + USER_SEARCH_FIELDS
+    search_fields = ("application__client_id", "application__name", "consent_version") + USER_SEARCH_FIELDS
     list_filter = ("application",)
     actions = ("revoke_tokens",)
 
@@ -147,10 +147,10 @@ class AccessTokenAdmin(admin.ModelAdmin):
 
 
 class GrantAdmin(admin.ModelAdmin):
-    list_display = ("pk", "masked_code", "application", "user", "expires")
+    list_display = ("pk", "masked_code", "application", "user", "expires", "consent_version")
     raw_id_fields = ("user",)
     # Search by non-secret identifiers only; never by the authorization code itself.
-    search_fields = ("application__client_id", "application__name") + USER_SEARCH_FIELDS
+    search_fields = ("application__client_id", "application__name", "consent_version") + USER_SEARCH_FIELDS
 
     def has_add_permission(self, request):
         # Authorization codes are issued by the OAuth flows, not hand-created in the admin.
@@ -192,11 +192,11 @@ class IDTokenAdmin(admin.ModelAdmin):
 
 
 class RefreshTokenAdmin(admin.ModelAdmin):
-    list_display = ("pk", "masked_token", "user", "application")
+    list_display = ("pk", "masked_token", "user", "application", "consent_version")
     list_select_related = ("application", "user")
     raw_id_fields = ("user", "access_token")
     # Search by non-secret identifiers only; never by the token itself.
-    search_fields = ("application__client_id", "application__name") + USER_SEARCH_FIELDS
+    search_fields = ("application__client_id", "application__name", "consent_version") + USER_SEARCH_FIELDS
     list_filter = ("application",)
     actions = ("revoke_tokens",)
 

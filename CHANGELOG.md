@@ -15,6 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Versioned data-usage consent. A new `CONSENT_BACKEND_CLASS` setting names the terms version the
+  consent page displays and decides when a recorded consent is no longer valid; the shipped
+  `StaticConsentBackend` returns no version and never invalidates, so the feature stays dormant until
+  configured. The version is signed into the consent form (and the device-confirmation form), so a
+  submission whose terms changed while the page was open is refused and re-prompted rather than
+  recorded against the new terms, and a tampered field is rejected. The verified version is stored on
+  the new `consent_version` field of the grant, access token, refresh token and device grant
+  (migration `0033`; swapped models need their own migration): code exchange and the device flow copy
+  it onto their tokens, implicit/hybrid issuance takes it from the signed form, and refresh preserves
+  it across the whole token chain including rotation. The new
+  `CONSENT_VERSION_ENFORCE_ON_REFRESH` setting (off by default) makes the token endpoint reject a
+  refresh whose recorded consent is no longer valid with `invalid_grant`. `approval_prompt=auto` and
+  `prompt=none` now also require an existing token whose consent is current, and `skip_authorization`
+  records the version in force. The grant, access-token and refresh-token admins display and search
+  the field.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

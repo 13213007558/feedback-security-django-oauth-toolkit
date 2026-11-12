@@ -2,6 +2,7 @@ import json
 
 from django import forms, http
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.core import signing
 from django.core.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
@@ -12,6 +13,7 @@ from oauthlib.common import Request as OAuthlibRequest
 from oauthlib.common import urlencode
 from oauthlib.oauth2 import DeviceApplicationServer
 
+from oauth2_provider.authorization_server.consent import get_consent_backend
 from oauth2_provider.authorization_server.views.mixins import AuthorizationServerViewMixin
 from oauth2_provider.core.compat import login_not_required
 from oauth2_provider.core.scopes import get_scopes_backend
@@ -24,6 +26,9 @@ from oauth2_provider.models import (
     get_application_model,
     get_device_grant_model,
 )
+
+
+CONSENT_VERSION_SALT = "oauth2_provider.consent_version"
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -158,6 +163,25 @@ class DeviceConfirmForm(forms.Form):
     """
 
     action = forms.CharField(required=True)
+    # The data-usage terms version rendered on the confirm page, signed so an
+    # approval can only be recorded against the version the resource owner saw.
+    consent_version = forms.CharField(required=False, widget=forms.HiddenInput())
+
+    def clean_consent_version(self) -> str:
+        signed = self.cleaned_data.get("consent_version") or ""
+        if not signed:
+            return ""
+        try:
+            version = signing.loads(signed, salt=CONSENT_VERSION_SALT)
+        except signing.BadSignature:
+            raise ValidationError(
+                "The data-usage terms version could not be verified.", code="bad_consent_version"
+            )
+        if not isinstance(version, str):
+            raise ValidationError(
+                "The data-usage terms version could not be verified.", code="bad_consent_version"
+            )
+        return version
 
 
 class DeviceConfirmView(LoginRequiredMixin, FormView):
@@ -215,8 +239,20 @@ class DeviceConfirmView(LoginRequiredMixin, FormView):
         action = form.cleaned_data["action"]
 
         if action == "accept":
+            application = get_application_model().objects.get(client_id=device.client_id)
+            consent_backend = get_consent_backend()
+            current_version = consent_backend.get_consent_version(self.request, application)
+            consented_version = form.cleaned_data.get("consent_version", "")
+            if current_version and not consent_backend.is_consent_valid(
+                consented_version, current_version, self.request, application
+            ):
+                # The terms changed while the confirm page was open: re-render
+                # it with the current version instead of recording a stale
+                # consent on the device grant.
+                return self._render_updated_consent(current_version)
+            device.consent_version = consented_version
             device.status = device.AUTHORIZED
-            device.save(update_fields=["status"])
+            device.save(update_fields=["status", "consent_version"])
             return super().form_valid(form)
         elif action == "deny":
             device.status = device.DENIED
@@ -225,16 +261,35 @@ class DeviceConfirmView(LoginRequiredMixin, FormView):
         else:
             return http.HttpResponseBadRequest()
 
+    def _render_updated_consent(self, consent_version: str) -> http.HttpResponse:
+        """Re-render the confirm page for the current terms version."""
+        self.object = None
+        context = self.get_context_data(
+            form=self.get_form(self.get_form_class()),
+            consent_version=consent_version,
+            consent_version_signed=signing.dumps(consent_version, salt=CONSENT_VERSION_SALT),
+        )
+        return self.render_to_response(context)
+
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         client_id = self.kwargs.get("client_id")
-        context["application"] = get_object_or_404(get_application_model(), client_id=client_id)
+        application = get_object_or_404(get_application_model(), client_id=client_id)
+        context["application"] = application
 
         device = self.get_object()
         all_scopes = get_scopes_backend().get_all_scopes()
         scopes = device.scope.split() if device.scope is not None else []
         context["scopes"] = scopes
         context["scopes_descriptions"] = [all_scopes.get(scope, scope) for scope in scopes]
+
+        consent_version = context.get("consent_version")
+        if consent_version is None:
+            consent_version = get_consent_backend().get_consent_version(self.request, application)
+        context["consent_version"] = consent_version
+        context.setdefault(
+            "consent_version_signed", signing.dumps(consent_version, salt=CONSENT_VERSION_SALT)
+        )
 
         return context
 

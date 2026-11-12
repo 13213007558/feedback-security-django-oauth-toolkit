@@ -120,6 +120,16 @@ DEFAULTS = {
     "ROTATE_REFRESH_TOKEN": True,
     "ERROR_RESPONSE_WITH_SCOPES": False,
     "REQUEST_APPROVAL_PROMPT": "force",
+    # Versioned data-usage consent. The backend names the terms version the
+    # consent page currently displays and decides when an older recorded consent
+    # no longer covers a request. The static default reports no version and
+    # never invalidates, so installs without versioned terms keep the old flow.
+    "CONSENT_BACKEND_CLASS": "oauth2_provider.authorization_server.consent.StaticConsentBackend",
+    # When True, a refresh token whose recorded consent version is no longer
+    # valid for the backend's current version is rejected (invalid_grant), so a
+    # terms change that invalidates old consents ends the refresh chain instead
+    # of minting new tokens under a consent the resource owner never gave.
+    "CONSENT_VERSION_ENFORCE_ON_REFRESH": False,
     # Redirect URI / scheme validation
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
     "ALLOWED_SCHEMES": ["https"],
@@ -374,6 +384,7 @@ IMPORT_STRINGS = (
     "OAUTH2_VALIDATOR_CLASS",
     "OAUTH2_BACKEND_CLASS",
     "SCOPES_BACKEND_CLASS",
+    "CONSENT_BACKEND_CLASS",
     "APPLICATION_FORM_CLASS",
     "APPLICATION_ADMIN_CLASS",
     "ACCESS_TOKEN_ADMIN_CLASS",

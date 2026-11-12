@@ -4,6 +4,7 @@ from django.conf import settings
 from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.sessions.middleware import SessionMiddleware
 
+from oauth2_provider.authorization_server.consent import BaseConsentBackend
 from oauth2_provider.oauth2_validators import OAuth2Validator
 
 
@@ -11,6 +12,26 @@ from oauth2_provider.oauth2_validators import OAuth2Validator
 # the way we're using it, so we just use a lambda that returns None
 def get_response():
     None
+
+
+class DemoConsentBackend(BaseConsentBackend):
+    """Example versioned data-usage consent backend for the demo IdP.
+
+    The terms version is read from the ``OAUTH2_PROVIDER_CONSENT_VERSION``
+    environment variable (defaulting to an empty string, which keeps consent
+    versioning dormant). Bump it to a new value and every consent page starts
+    presenting that version; because validity is an exact match, previously
+    issued consents no longer cover new requests and users must consent again.
+    Point ``CONSENT_BACKEND_CLASS`` at this class to try it end to end.
+    """
+
+    def get_consent_version(self, request, application=None) -> str:
+        return settings.OAUTH2_PROVIDER_CONSENT_VERSION
+
+    def is_consent_valid(
+        self, consented_version, current_version, request=None, application=None
+    ) -> bool:
+        return consented_version == current_version
 
 
 class CustomOAuth2Validator(OAuth2Validator):

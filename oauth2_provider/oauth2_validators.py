@@ -27,6 +27,7 @@ from oauthlib.oauth2.rfc6749 import errors, utils
 from oauthlib.openid import RequestValidator
 
 from .authorization_server import cimd, client_assertions
+from .authorization_server.consent import get_consent_backend
 from .authorization_server.oidc.claims import (
     claim_value_matches,
     normalize_claims_request,
@@ -46,6 +47,7 @@ from .models import (
     AbstractRefreshToken,
     get_access_token_model,
     get_application_model,
+    get_device_grant_model,
     get_grant_model,
     get_id_token_model,
     get_refresh_token_model,
@@ -98,6 +100,8 @@ GRANT_TYPE_MAPPING = {
     ),
     "urn:ietf:params:oauth:grant-type:device_code": (AbstractApplication.GRANT_DEVICE_CODE,),
 }
+
+GRANT_TYPE_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code"
 
 Application = get_application_model()
 AccessToken = get_access_token_model()
@@ -912,6 +916,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             source_refresh_token=source_refresh_token,
             resource=getattr(request, "resource", []),  # RFC 8707
             claims=self._claims_request_to_store(request),  # OIDC Core 5.5
+            consent_version=self._consent_version_to_store(request, source_refresh_token),
         )
         self._set_token_value(access_token, token["access_token"])
         access_token.save()
@@ -926,6 +931,40 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         if not oauth2_settings.OIDC_CLAIMS_PARAMETER_ENABLED:
             return {}
         return safe_normalize_claims_request(getattr(request, "claims", None))
+
+    def _consent_version_to_store(
+        self, request: OauthlibRequest, source_refresh_token: AbstractRefreshToken | None = None
+    ) -> str:
+        """
+        The data-usage terms version an issued token must be pinned to.
+
+        The version comes from the consent that authorizes this issuance, never
+        from the backend's current value: a code exchange reads it off the grant
+        (which the signed consent form wrote), an implicit/hybrid issuance off
+        the request credentials, a refresh off the existing refresh token, and a
+        device-code exchange off the approved device grant. Client-credentials
+        has no resource-owner consent and stays empty.
+        """
+        grant_type = getattr(request, "grant_type", None)
+        if grant_type == "authorization_code":
+            grant = Grant.objects.filter(code=request.code, application=request.client).first()
+            return grant.consent_version if grant is not None else ""
+        if grant_type == "refresh_token":
+            # During rotation the previous refresh token is revoked and its
+            # request-scoped instance may be cleared before the new tokens are
+            # built; ``source_refresh_token`` (passed by _save_bearer_token)
+            # still identifies it, so prefer that, then the request instance.
+            if source_refresh_token is not None:
+                return source_refresh_token.consent_version
+            refresh_token_instance = getattr(request, "refresh_token_instance", None)
+            return refresh_token_instance.consent_version if refresh_token_instance is not None else ""
+        if grant_type == GRANT_TYPE_DEVICE_CODE:
+            device_code = request._params.get("device_code")
+            device = get_device_grant_model().objects.filter(device_code=device_code).first()
+            return device.consent_version if device is not None else ""
+        # Implicit/hybrid (no grant_type, credentials merged onto the request)
+        # and any other path: carry what the consent recorded, defaulting empty.
+        return getattr(request, "consent_version", "") or ""
 
     def _create_authorization_code(self, request, code, expires=None):
         if not expires:
@@ -958,6 +997,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             acr=self._get_id_token_acr(request) or "",
             claims=json.dumps(request.claims or {}),
             resource=resource,
+            consent_version=getattr(request, "consent_version", "") or "",
         )
 
     def _create_refresh_token(self, request, refresh_token_code, access_token, previous_refresh_token):
@@ -971,6 +1011,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             access_token=access_token,
             token_family=token_family,
             resource=getattr(request, "resource", []),  # RFC 8707
+            consent_version=access_token.consent_version,
         )
         self._set_token_value(refresh_token, refresh_token_code)
         try:
@@ -1165,6 +1206,20 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             # the access token this refresh token already minted.
             source = rt.access_token or AccessToken.objects.filter(source_refresh_token=rt).first()
             request.claims = source.claims if source is not None else {}
+
+        if oauth2_settings.CONSENT_VERSION_ENFORCE_ON_REFRESH:
+            # A terms change that invalidates this consent ends the refresh chain:
+            # the resource owner must authorize again under the current version
+            # instead of receiving new tokens under terms they never accepted.
+            # Rows without a recorded version (client-credentials, or consents
+            # predating versioning) are left to the same rule only when the
+            # backend now serves a version, which itself makes them stale.
+            consent_backend = get_consent_backend()
+            current_version = consent_backend.get_consent_version(request, rt.application)
+            if current_version and not consent_backend.is_consent_valid(
+                rt.consent_version, current_version, request, rt.application
+            ):
+                return False
 
         request.user = rt.user
         # Use the raw token presented in the request, not rt.token: under hashed-at-rest

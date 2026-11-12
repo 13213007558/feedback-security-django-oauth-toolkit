@@ -1,4 +1,5 @@
 {% extends "oauth2_provider/base.html" %}
+{% load i18n %}
 {% block content %}
 <html>
 <head>
@@ -11,8 +12,12 @@
             <li>{{ scope }}</li>
         {% endfor %}
     </ul>
+    {% if consent_version %}
+        <p>{% trans "Data usage terms version" %}: {{ consent_version }}</p>
+    {% endif %}
     <form method="post">
         {% csrf_token %}
+        <input type="hidden" name="consent_version" value="{{ consent_version_signed }}">
         <button type="submit" name="action" value="accept">Accept</button>
         <button type="submit" name="action" value="deny">Deny</button>
     </form>

@@ -371,6 +371,28 @@ REQUEST_APPROVAL_PROMPT
 Can be ``'force'`` or ``'auto'``.
 The strategy used to display the authorization form. Refer to :ref:`skip-auth-form`.
 
+CONSENT_BACKEND_CLASS
+~~~~~~~~~~~~~~~~~~~~~
+Default: ``"oauth2_provider.authorization_server.consent.StaticConsentBackend"``
+
+The dotted path of the backend that names the data-usage terms version the consent
+page displays and decides when a recorded consent is no longer valid. The static
+default reports no version (the empty string) and never invalidates, so installations
+without versioned terms keep the previous behavior. See :ref:`consent-versioning` for
+the backend interface and the recorded fields.
+
+CONSENT_VERSION_ENFORCE_ON_REFRESH
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``False``
+
+When ``True``, a refresh token whose recorded consent version the configured
+``CONSENT_BACKEND_CLASS`` no longer considers valid is rejected at the token endpoint
+with ``invalid_grant``, ending the refresh chain until the resource owner authorizes
+again under the current terms. When ``False`` (the default) a terms change does not
+break existing refresh chains, and every refreshed token keeps the consent version it
+was originally granted under. Refer to :ref:`consent-versioning`.
+
+
 ALLOWED_REDIRECT_URI_SCHEMES
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default: ``["http", "https"]``

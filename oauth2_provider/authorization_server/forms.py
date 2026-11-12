@@ -38,6 +38,10 @@ class AllowForm(forms.Form):
     # form posts back to carries only request_uri.
     acr_values = forms.CharField(required=False, widget=forms.HiddenInput())
     resource = forms.CharField(required=False, widget=forms.HiddenInput())  # RFC 8707
+    # The data-usage terms version rendered on this page, signed by the view so a
+    # version changed between GET and POST cannot be recorded as the one the
+    # resource owner actually saw. Empty when consent versioning is not used.
+    consent_version = forms.CharField(required=False, widget=forms.HiddenInput())
 
 
 class ConfirmLogoutForm(forms.Form):

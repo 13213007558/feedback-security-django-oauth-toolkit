@@ -22,6 +22,10 @@
                     {% endfor %}
                 </ul>
 
+                {% if consent_version %}
+                    <p>{% trans "Data usage terms version" %}: {{ consent_version }}</p>
+                {% endif %}
+
                 {% if requested_claims %}
                     <p>{% trans "Application also requests the following information" %}</p>
                     <ul>
