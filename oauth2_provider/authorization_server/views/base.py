@@ -33,6 +33,7 @@ from oauthlib.openid.connect.core.exceptions import (
 )
 
 from oauth2_provider.authorization_server import par, stored_requests
+from oauth2_provider.authorization_server.authentication import get_authentication_proof, unsatisfied_scopes
 from oauth2_provider.authorization_server.forms import AllowForm
 from oauth2_provider.authorization_server.oidc import request_objects
 from oauth2_provider.authorization_server.oidc.claims import (
@@ -762,6 +763,15 @@ class AuthorizationView(BaseAuthorizationView, FormView):
             if max_age_response is not None:
                 return max_age_response
 
+        # A scope with an authentication requirement needs proof from the
+        # authentication system (a recent or strengthened authentication), not
+        # just an authenticated session.
+        unmet = unsatisfied_scopes(scopes, get_authentication_proof(request))
+        if unmet:
+            return self._handle_unmet_authentication(
+                credentials, prompt, reauthenticated, returned_without_login, unmet
+            )
+
         all_scopes = get_scopes_backend().get_all_scopes()
         kwargs["scopes_descriptions"] = [all_scopes[scope] for scope in scopes]
         kwargs["scopes"] = scopes
@@ -898,6 +908,36 @@ class AuthorizationView(BaseAuthorizationView, FormView):
             self._releasable_claim_names(application, scopes, credentials) if requested_claims else []
         )
         return self.render_to_response(self.get_context_data(**kwargs))
+
+    def _handle_unmet_authentication(
+        self,
+        credentials: dict,
+        prompt: set,
+        reauthenticated: bool,
+        returned_without_login: bool,
+        unmet: list[str],
+    ) -> HttpResponse:
+        """Answer an authorization request whose scopes need an authentication
+        the proof recorded for this session does not satisfy.
+
+        The user is sent to re-authenticate once; what satisfies the
+        requirement (a fresh login, an MFA step-up) is the authentication
+        system's call. Coming back from that redirect with a fresh login that
+        still does not satisfy it -- or without having logged in at all -- is
+        answered with ``access_denied`` rather than another redirect, so the
+        flow cannot loop. ``prompt=none`` forbids the interaction and gets
+        ``interaction_required`` instead.
+        """
+        log.debug(
+            "Authorization request needs re-authentication: the authentication "
+            "proof does not cover the scopes %s.",
+            unmet,
+        )
+        if "none" in prompt:
+            return self._login_required_response(credentials, error="interaction_required")
+        if reauthenticated or returned_without_login:
+            return self._login_required_response(credentials, error="access_denied")
+        return self._redirect_to_login()
 
     @staticmethod
     def _resources_covered(credentials: dict, granted: list[str]) -> bool:

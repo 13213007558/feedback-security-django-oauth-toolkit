@@ -120,6 +120,21 @@ DEFAULTS = {
     "ROTATE_REFRESH_TOKEN": True,
     "ERROR_RESPONSE_WITH_SCOPES": False,
     "REQUEST_APPROVAL_PROMPT": "force",
+    # Authentication proof for sensitive scopes (step-up authentication).
+    # The backend reports how, and how recently, the end-user authenticated,
+    # from authentication-system state (the default reads the Django session);
+    # client request parameters are never proof. See
+    # oauth2_provider.authorization_server.authentication.
+    "AUTHENTICATION_PROOF_BACKEND": (
+        "oauth2_provider.authorization_server.authentication.SessionAuthenticationProofBackend"
+    ),
+    # The authentication levels the deployment recognizes, weakest first; a
+    # proof meets a required level when its own level ranks at least as high.
+    "AUTHENTICATION_PROOF_LEVELS": [],
+    # Scopes that require proof of authentication: {scope: {"level": str,
+    # "max_age_seconds": number}}, either key optional. A scope not listed
+    # needs no proof.
+    "SCOPE_AUTHENTICATION_REQUIREMENTS": {},
     # Redirect URI / scheme validation
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
     "ALLOWED_SCHEMES": ["https"],
@@ -388,6 +403,7 @@ IMPORT_STRINGS = (
     "CIMD_REGISTRATION_PERMISSION_CLASSES",
     "CLIENT_ASSERTION_JWKS_FETCHER",
     "OIDC_REQUEST_URI_FETCHER",
+    "AUTHENTICATION_PROOF_BACKEND",
 )
 
 

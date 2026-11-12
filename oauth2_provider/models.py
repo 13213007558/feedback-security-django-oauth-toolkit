@@ -1054,6 +1054,13 @@ class AbstractGrant(models.Model):
     )
     claims = models.TextField(blank=True, verbose_name=_("claims"))
 
+    # The proof of how, and how recently, the End-User authenticated, as
+    # recorded by the authentication system at the authorization endpoint
+    # (oauth2_provider.authorization_server.authentication). It travels to the
+    # refresh token issued at code exchange, so refreshes can be checked
+    # against the original authentication. Empty when no proof was recorded.
+    authentication = models.JSONField(blank=True, default=dict, verbose_name=_("authentication proof"))
+
     resource = ResourceJSONField(blank=True, default=list, verbose_name=_("resource"))
 
     def is_expired(self):
@@ -1300,6 +1307,13 @@ class AbstractRefreshToken(models.Model):
         verbose_name=_("access token"),
     )
     token_family = models.UUIDField(null=True, blank=True, editable=False, verbose_name=_("token family"))
+
+    # The proof of the End-User's authentication this token descends from
+    # (oauth2_provider.authorization_server.authentication), inherited from the
+    # grant -- and by each rotated refresh token from its predecessor -- so a
+    # refresh is checked against the original authentication, never a sliding
+    # one. Empty when no proof was recorded.
+    authentication = models.JSONField(blank=True, default=dict, verbose_name=_("authentication proof"))
 
     resource = ResourceJSONField(blank=True, default=list, verbose_name=_("resource"))
 

@@ -413,6 +413,71 @@ to support the authorization code *and* client credentials grants, you might do 
             # Assume, for this example, that self.authorization_grant_type is set to self.GRANT_AUTHORIZATION_CODE
             return bool( set([self.authorization_grant_type, self.GRANT_CLIENT_CREDENTIALS]) & grant_types )
 
+.. _authentication-proof:
+
+Requiring proof of authentication for scopes
+============================================
+
+Some scopes should only be issued when the End-User's authentication is strong
+enough and recent enough -- a payment scope behind an MFA step-up, say, rather
+than a password login from last week. What proves that is the authentication
+system's business, never the client's: a self-reported request parameter is a
+statement of preference, not proof. Django OAuth Toolkit keeps the two apart
+with an extension point in
+:mod:`oauth2_provider.authorization_server.authentication`:
+
+* The **authentication system records a proof**. After verifying the End-User
+  (a password login, an MFA step-up, a WebAuthn ceremony), it calls
+  :func:`~oauth2_provider.authorization_server.authentication.record_authentication_proof`
+  with the level that verification warrants::
+
+      from oauth2_provider.authorization_server.authentication import record_authentication_proof
+
+      def mfa_verified(request):
+          record_authentication_proof(request, "mfa")
+
+  The default backend keeps the proof in the Django session it authenticated,
+  so it dies with the session and can never be influenced by request
+  parameters. A deployment that keeps authentication state elsewhere (an MFA
+  framework such as django-otp, a hardware-backed store) replaces the backend
+  via ``AUTHENTICATION_PROOF_BACKEND``.
+
+* The **authorization server checks the proof** against
+  ``SCOPE_AUTHENTICATION_REQUIREMENTS``, at every point where a token can come
+  out:
+
+  * At the **authorization endpoint**, an unmet requirement sends the End-User
+    to re-authenticate (what satisfies it is the authentication system's
+    call). Coming back with a fresh login that still does not satisfy it --
+    or without having logged in -- is answered with ``access_denied`` rather
+    than another redirect, so the flow cannot loop; ``prompt=none`` gets
+    ``interaction_required``.
+  * At **authorization-code exchange** and on every **refresh**, the End-User
+    is absent, so the issued scopes are *narrowed* to those the proof still
+    satisfies (RFC 6749 section 3.3 lets a token be issued with fewer scopes
+    than granted, reported in the ``scope`` response parameter).
+
+  The proof -- its level and the time the authentication happened -- travels
+  from the grant to the refresh token, and each rotated refresh token inherits
+  it unchanged. A refresh is therefore always checked against the *original*
+  authentication: once the proof falls outside the required age, the sensitive
+  scope lapses out of the refreshed token, and no refresh of the old
+  credential chain can bring it back. Only a new authorization, backed by a
+  fresh proof, can.
+
+Levels are ordered by the ``AUTHENTICATION_PROOF_LEVELS`` setting, weakest
+first; a proof meets a required level when its own level ranks at least as
+high. ``max_age_seconds`` bounds how old the authentication may be. Scopes
+without a configured requirement need no proof and flow exactly as before, and
+grants with no End-User authentication at all (client credentials, password,
+device code) carry no proof, so required scopes are narrowed out of the tokens
+they issue.
+
+All freshness checks read
+:func:`~oauth2_provider.authorization_server.authentication.authentication_clock`,
+so tests and demos can drive proof expiry with a controllable clock without
+touching token lifetimes.
+
 .. _custom-scopes-backend:
 
 Custom scopes backend

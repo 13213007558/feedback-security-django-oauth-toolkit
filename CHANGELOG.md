@@ -15,6 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Scope gating on proof of (recent, strengthened) authentication, via the new
+  `oauth2_provider.authorization_server.authentication` extension point. The authentication
+  system records an `AuthenticationProof` (level plus authentication time) with
+  `record_authentication_proof()`; the backend named by the new `AUTHENTICATION_PROOF_BACKEND`
+  setting reports it to the authorization server (the default keeps it in the Django session, so
+  client-sent request parameters can never be taken as proof). Scopes listed in the new
+  `SCOPE_AUTHENTICATION_REQUIREMENTS` setting (`{"scope": {"level": ..., "max_age_seconds": ...}}`,
+  levels ordered by the new `AUTHENTICATION_PROOF_LEVELS` setting) are issued only while the proof
+  satisfies the requirement: at the authorization endpoint an unmet requirement sends the End-User
+  to re-authenticate (a failed or skipped re-authentication is answered with `access_denied`,
+  `interaction_required` for `prompt=none`); at code exchange and on every refresh the issued
+  scopes are narrowed to those the proof still satisfies. The proof travels from the grant (new
+  `authentication` field, migration `0033`) to the refresh token (same new field) and is inherited
+  unchanged by rotation, so a sensitive scope cannot be kept alive by refreshing once the
+  authentication behind it is too old. Swapped grant and refresh-token models need a migration for
+  the new field.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

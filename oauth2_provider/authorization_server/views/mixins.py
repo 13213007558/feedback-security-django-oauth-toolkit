@@ -9,6 +9,7 @@ endpoints. It builds on the shared
 from django.http import HttpRequest
 from oauthlib.oauth2.rfc6749 import errors as oauth2_errors
 
+from oauth2_provider.authorization_server.authentication import get_authentication_proof
 from oauth2_provider.authorization_server.response_modes import (
     add_params_to_authorization_redirect,
     response_mode_permitted,
@@ -49,6 +50,14 @@ class AuthorizationServerViewMixin(OAuthLibCoreMixin):
         """
         # TODO: move this scopes conversion from and to string into a utils function
         scopes = scopes.split(" ") if scopes else []
+
+        # The proof of the End-User's authentication, from the authentication
+        # system via the configured backend -- never from anything the client
+        # sent. Assigned unconditionally, like the user in
+        # OAuthLibCore.create_authorization_response, so a value smuggled in
+        # as a request parameter or a tampered form field is always replaced.
+        proof = get_authentication_proof(request)
+        credentials["auth_proof"] = proof.to_dict() if proof is not None else None
 
         core = self.get_oauthlib_core()
         return core.create_authorization_response(request, scopes, credentials, allow)

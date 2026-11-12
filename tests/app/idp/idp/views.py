@@ -2,7 +2,9 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from django.contrib.auth.views import LoginView
+from django.http import HttpResponse
 
+from oauth2_provider.authorization_server.authentication import record_authentication_proof
 from oauth2_provider.models import AbstractApplication, get_application_model
 
 
@@ -17,6 +19,16 @@ class ClientBrandedLoginView(LoginView):
     ``oidcc-registration-policy-uri`` and ``oidcc-registration-tos-uri``
     screenshot.
     """
+
+    def form_valid(self, form: Any) -> HttpResponse:
+        # The authentication system's side of the authentication-proof
+        # extension point: a password login proves the "password" level, so
+        # scopes whose SCOPE_AUTHENTICATION_REQUIREMENTS that satisfies can be
+        # issued to this session. A deployment with a stronger method (MFA,
+        # WebAuthn) would record its own level after verifying it.
+        response = super().form_valid(form)
+        record_authentication_proof(self.request, "password")
+        return response
 
     def get_context_data(self, **kwargs: Any) -> dict[str, Any]:
         context = super().get_context_data(**kwargs)

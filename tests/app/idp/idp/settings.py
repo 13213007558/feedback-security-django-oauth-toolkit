@@ -128,6 +128,12 @@ ipUMvb4Se0LDJnmFuv8v6gM6V4vyXkP855mNOiRHUOHOSKdQ3SeKrLlnR6I=
     OAUTH2_PROVIDER_DEFAULT_SCOPES=(list, ["openid"]),
     OAUTH2_PROVIDER_PKCE_REQUIRED=(bool, True),
     OAUTH2_PROVIDER_PKCE_REQUIRED_CLIENT_IDS=(list, []),
+    # Authentication proof for sensitive scopes: the levels this IdP can
+    # record (its password login records "password"; see idp.views), and the
+    # scopes that require a proof, e.g. {"payment": {"level": "password",
+    # "max_age_seconds": 300}}.
+    OAUTH2_PROVIDER_AUTHENTICATION_PROOF_LEVELS=(list, ["password"]),
+    OAUTH2_PROVIDER_SCOPE_AUTHENTICATION_REQUIREMENTS=(dict, {}),
     OAUTH2_PROVIDER_ALLOWED_SCHEMES=(list, ["https", "http"]),
     # Cookie/CSRF posture is env-driven so the cross-site end-to-end layer can
     # serve this IdP over TLS with SESSION_COOKIE_SAMESITE=None -- required for
@@ -313,6 +319,8 @@ OAUTH2_PROVIDER = {
     "DEFAULT_SCOPES": env("OAUTH2_PROVIDER_DEFAULT_SCOPES"),
     "PKCE_REQUIRED": pkce_required,
     "ALLOWED_SCHEMES": env("OAUTH2_PROVIDER_ALLOWED_SCHEMES"),
+    "AUTHENTICATION_PROOF_LEVELS": env("OAUTH2_PROVIDER_AUTHENTICATION_PROOF_LEVELS"),
+    "SCOPE_AUTHENTICATION_REQUIREMENTS": env("OAUTH2_PROVIDER_SCOPE_AUTHENTICATION_REQUIREMENTS"),
     "DCR_ENABLED": env("OAUTH2_PROVIDER_DCR_ENABLED"),
     # RFC 9700 compliance gates (see docs/security.rst).
     "COMPLIANT_BCP_RFC9700_IMPLICIT_GRANT": env("OAUTH2_PROVIDER_COMPLIANT_BCP_RFC9700_IMPLICIT_GRANT"),

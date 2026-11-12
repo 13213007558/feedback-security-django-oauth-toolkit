@@ -26,7 +26,7 @@ from oauthlib.common import Request as OauthlibRequest
 from oauthlib.oauth2.rfc6749 import errors, utils
 from oauthlib.openid import RequestValidator
 
-from .authorization_server import cimd, client_assertions
+from .authorization_server import authentication, cimd, client_assertions
 from .authorization_server.oidc.claims import (
     claim_value_matches,
     normalize_claims_request,
@@ -513,6 +513,11 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
                 # Assigned even when empty, so a client-sent "acr" parameter, which
                 # oauthlib would otherwise expose as request.acr, is never used.
                 request.acr = grant.acr or None
+                # The authentication proof recorded on the grant, assigned even
+                # when empty for the same reason: a client-sent parameter must
+                # never be taken as proof (see
+                # oauth2_provider.authorization_server.authentication).
+                request.auth_proof = grant.authentication or None
                 if grant.claims:
                     request.claims = json.loads(grant.claims)
                 return True
@@ -770,6 +775,8 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         if "scope" not in token:
             raise FatalClientError("Failed to renew access token: missing scope")
 
+        self._apply_authentication_scope_requirements(token, request)
+
         self._check_and_set_request_resource(request)
 
         # The token handler normally puts the lifetime it used in the token dict, so the
@@ -889,6 +896,56 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         else:
             self._create_access_token(expires, request, token)
 
+    def _apply_authentication_scope_requirements(self, token, request) -> None:
+        """
+        Apply ``SCOPE_AUTHENTICATION_REQUIREMENTS`` to the token being issued.
+
+        At the authorization endpoint (no ``grant_type``; implicit and hybrid
+        flows) an unmet requirement refuses the issuance with
+        ``access_denied``: the End-User is present and can re-authenticate. At
+        the token endpoint the End-User is absent, so the issued scopes are
+        narrowed to those the proof still satisfies (RFC 6749 section 3.3): a
+        sensitive scope lapses when the authentication behind it grows too old
+        instead of being kept alive by refreshes.
+
+        The proof comes only from first-party state: the value
+        ``validate_code()`` restored from the grant, the presented refresh
+        token's own record, or the value the authorization response set from
+        the authentication backend. A client-sent parameter is never proof.
+        """
+        requirements = authentication.scope_authentication_requirements()
+        if not requirements:
+            return
+        grant_type = getattr(request, "grant_type", None)
+        if grant_type == "refresh_token":
+            refresh_token_instance = getattr(request, "refresh_token_instance", None)
+            proof = None
+            if refresh_token_instance is not None:
+                proof = refresh_token_instance.authentication or None
+        elif grant_type in (None, "authorization_code"):
+            # Set by validate_code() from the grant at the token endpoint, and
+            # through the authorization response's credentials at the
+            # authorization endpoint; both overwrite any client-sent value.
+            proof = getattr(request, "auth_proof", None)
+        else:
+            # Grants without an End-User authentication (client_credentials,
+            # password, device_code) carry no proof.
+            proof = None
+        unmet = authentication.unsatisfied_scopes(token["scope"].split(), proof)
+        if not unmet:
+            return
+        if grant_type is None:
+            raise errors.AccessDeniedError(
+                description=(
+                    "The authentication does not meet the requirements of the scopes: %s" % " ".join(unmet)
+                ),
+                request=request,
+            )
+        narrowed = [scope for scope in token["scope"].split() if scope not in set(unmet)]
+        token["scope"] = " ".join(narrowed)
+        if getattr(request, "scopes", None) is not None:
+            request.scopes = narrowed
+
     def _set_token_value(
         self, token_instance: AbstractAccessToken | AbstractRefreshToken, raw_token: str
     ) -> None:
@@ -945,6 +1002,21 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         # RFC 8707: Extract resource parameter
         resource = getattr(request, "resource", [])
 
+        # The proof of the End-User's authentication travels with the code, so
+        # the constraints it satisfies can be checked again at exchange and on
+        # every refresh. A scope whose requirement the proof does not meet is
+        # refused here, while the End-User is still present to re-authenticate,
+        # rather than silently dropped.
+        auth_proof = getattr(request, "auth_proof", None)
+        unmet = authentication.unsatisfied_scopes(request.scopes, auth_proof)
+        if unmet:
+            raise errors.AccessDeniedError(
+                description=(
+                    "The authentication does not meet the requirements of the scopes: %s" % " ".join(unmet)
+                ),
+                request=request,
+            )
+
         return Grant.objects.create(
             application=request.client,
             user=request.user,
@@ -957,19 +1029,32 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             nonce=request.nonce or "",
             acr=self._get_id_token_acr(request) or "",
             claims=json.dumps(request.claims or {}),
+            authentication=auth_proof or {},
             resource=resource,
         )
 
     def _create_refresh_token(self, request, refresh_token_code, access_token, previous_refresh_token):
         if previous_refresh_token:
             token_family = previous_refresh_token.token_family
+            # The proof of the authentication this token descends from is
+            # inherited unchanged: it records when the End-User actually
+            # authenticated, so a refresh can never make it younger.
+            authentication_proof = previous_refresh_token.authentication or {}
         else:
             token_family = uuid.uuid4()
+            if getattr(request, "grant_type", None) in (None, "authorization_code"):
+                # Set by validate_code() from the grant, or through the
+                # authorization response's credentials; any other grant type
+                # proves nothing about an End-User's authentication.
+                authentication_proof = getattr(request, "auth_proof", None) or {}
+            else:
+                authentication_proof = {}
         refresh_token = RefreshToken(
             user=request.user,
             application=request.client,
             access_token=access_token,
             token_family=token_family,
+            authentication=authentication_proof,
             resource=getattr(request, "resource", []),  # RFC 8707
         )
         self._set_token_value(refresh_token, refresh_token_code)

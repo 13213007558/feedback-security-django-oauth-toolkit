@@ -371,6 +371,50 @@ REQUEST_APPROVAL_PROMPT
 Can be ``'force'`` or ``'auto'``.
 The strategy used to display the authorization form. Refer to :ref:`skip-auth-form`.
 
+AUTHENTICATION_PROOF_BACKEND
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``"oauth2_provider.authorization_server.authentication.SessionAuthenticationProofBackend"``
+
+The import path of the class that reports proof of how, and how recently, the
+End-User authenticated, as an
+:class:`~oauth2_provider.authorization_server.authentication.AuthenticationProof`
+(or ``None``). Its ``get_proof(request)`` is called with the Django request at
+the authorization endpoint, so it can read authentication-system state such as
+the session; it must never derive the proof from client-sent request
+parameters, which are self-reported and not proof. The default backend reads
+the proof the authentication system recorded in the Django session with
+:func:`~oauth2_provider.authorization_server.authentication.record_authentication_proof`.
+See :ref:`authentication-proof`.
+
+AUTHENTICATION_PROOF_LEVELS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``[]``
+
+The authentication levels the deployment recognizes, weakest first (for
+example ``["password", "mfa"]``). A proof meets a required level when its own
+level ranks at least as high in this list. Recording a proof with a level not
+in the list is rejected, and a requirement naming a level not in the list is a
+configuration error.
+
+SCOPE_AUTHENTICATION_REQUIREMENTS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``{}``
+
+The scopes that require proof of authentication, as a mapping of scope name to
+a requirement with optional ``level`` and ``max_age_seconds`` keys, for
+example::
+
+    OAUTH2_PROVIDER = {
+        "AUTHENTICATION_PROOF_LEVELS": ["password", "mfa"],
+        "SCOPE_AUTHENTICATION_REQUIREMENTS": {
+            "payment": {"level": "mfa", "max_age_seconds": 300},
+        },
+    }
+
+A scope not listed needs no proof and flows exactly as before. See
+:ref:`authentication-proof` for how unmet requirements are handled at each
+endpoint.
+
 ALLOWED_REDIRECT_URI_SCHEMES
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default: ``["http", "https"]``
