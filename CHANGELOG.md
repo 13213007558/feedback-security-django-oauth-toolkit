@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* New `oauth2_provider.core.signals.refresh_token_revoked` signal, sent once per invalidated
+  refresh token by both `RefreshToken.revoke()` and the set-based `RefreshToken.revoke_family()`,
+  so a swapped model can register device-session logout (or any other side effect) from one
+  receiver instead of overriding each revocation path. The family sweep keeps its constant-query
+  `QuerySet.update()`/`.delete()` writes and reads the rows it invalidated in a single query; the
+  signal is dispatched through `transaction.on_commit(..., robust=True)`, so it fires only after
+  the revocation commits (never on rollback) and a receiver that raises is logged rather than
+  undoing the persisted revocation. See "Reacting to revocation on a swapped model" in the docs.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

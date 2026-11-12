@@ -23,6 +23,7 @@ from jwcrypto.common import JWException, base64url_encode
 from oauthlib.oauth2.rfc6749 import errors
 
 from .core.scopes import get_scopes_backend
+from .core.signals import refresh_token_revoked
 from .core.utils import jwk_allows_verification, jwk_from_pem
 from .generators import generate_client_id, generate_client_secret
 from .settings import oauth2_settings
@@ -1251,6 +1252,30 @@ class AccessToken(AbstractAccessToken):
         swappable = "OAUTH2_PROVIDER_ACCESS_TOKEN_MODEL"
 
 
+def _dispatch_refresh_token_revoked(refresh_token: "AbstractRefreshToken", using: str | None = None) -> None:
+    """
+    Arrange for :data:`refresh_token_revoked` to fire once the open revocation transaction
+    commits.
+
+    ``on_commit`` is what makes the notification agree with the security state: the hook is
+    discarded if the transaction rolls back, so a device-session logout (or any other
+    receiver side effect) is never announced for a revocation that did not persist. The
+    hook is ``robust`` so one receiver raising -- e.g. an unreachable push-notification
+    service -- is logged by Django and does not suppress the remaining receivers or undo
+    the already-committed revocation.
+
+    ``using`` is the alias the revocation transaction runs on, so the hook is registered on
+    the same connection rather than assumed to be ``default``. Called with an instance
+    rather than a primary key so the receiver gets the post-revocation state (``revoked``
+    set, ``access_token`` nulled) without an extra lookup.
+    """
+
+    def send() -> None:
+        refresh_token_revoked.send(sender=refresh_token.__class__, refresh_token=refresh_token)
+
+    transaction.on_commit(send, using=using, robust=True)
+
+
 class AbstractRefreshToken(models.Model):
     """
     A RefreshToken instance represents a token that can be swapped for a new
@@ -1328,6 +1353,17 @@ class AbstractRefreshToken(models.Model):
         One ``timezone.now()`` is stamped across the whole family. That is safe because
         ``token_checksum`` is unique on its own: two live members cannot share a checksum,
         so the shared timestamp has no uniqueness to collide with (#1816).
+
+        Extension contract. The security-critical writes stay set-based -- a
+        ``QuerySet.update()`` and a ``QuerySet.delete()`` -- which neither calls per-row
+        :meth:`revoke`/``save``/``delete`` nor emits the ORM ``post_save``/``post_delete``
+        signals. A swapped model therefore cannot hook the sweep by overriding :meth:`revoke`
+        alone. The invalidated members are read back in one query (filtered on the timestamp
+        just stamped) and each is announced through
+        :data:`~oauth2_provider.core.signals.refresh_token_revoked` after commit, the same
+        notification :meth:`revoke` sends, so device-session logout and similar side effects
+        fire on both paths. The read-back is a single query regardless of family size, so the
+        count still does not grow with the family.
         """
         if not token_family:
             return
@@ -1338,9 +1374,14 @@ class AbstractRefreshToken(models.Model):
         with transaction.atomic(using=access_token_database):
             now = timezone.now()
             # ``updated`` is ``auto_now``, which a queryset update does not trigger.
-            cls.objects.filter(token_family=token_family, revoked__isnull=True).update(
-                revoked=now, updated=now
-            )
+            revoked_queryset = cls.objects.filter(token_family=token_family, revoked__isnull=True)
+            revoked_queryset.update(revoked=now, updated=now)
+            # Read the invalidated rows back in a single query, *after* the update, so the
+            # signal carries exactly the rows this sweep stamped. A member rotated in between
+            # is still live and must not be announced as revoked; the access-token delete below
+            # already orphans and rejects it. Already-revoked members are excluded, so they are
+            # not notified a second time.
+            revoked_members = list(cls.objects.filter(token_family=token_family, revoked=now))
             # Deleting is what ``AccessToken.revoke()`` does, and ``access_token`` is
             # ``SET_NULL``, so this clears the pointer on the rows revoked above as well.
             # The family is re-read rather than snapshotted before the update, so a member
@@ -1350,10 +1391,20 @@ class AbstractRefreshToken(models.Model):
             access_token_model.objects.filter(
                 pk__in=cls.objects.filter(token_family=token_family).values("access_token_id")
             ).delete()
+            # Mirror the post-revocation state a per-row revoke() leaves on its instance:
+            # the bound access token has just been deleted and the FK SET_NULL'd.
+            for member in revoked_members:
+                member.access_token = None
+                member.access_token_id = None
+                _dispatch_refresh_token_revoked(member, using=access_token_database)
 
     def revoke(self):
         """
-        Mark this refresh token revoked and revoke related access token
+        Mark this refresh token revoked and revoke related access token, then announce the
+        revocation through :data:`~oauth2_provider.core.signals.refresh_token_revoked` once
+        the transaction commits. This is the single-row counterpart of :meth:`revoke_family`:
+        both end with the same post-commit notification, so a receiver such as device-session
+        logout does not need to know which path invalidated the credential.
         """
         access_token_model = get_access_token_model()
         access_token_database = router.db_for_write(access_token_model)
@@ -1363,6 +1414,7 @@ class AbstractRefreshToken(models.Model):
         with transaction.atomic(using=access_token_database):
             token = refresh_token_model.objects.select_for_update().filter(pk=self.pk, revoked__isnull=True)
             if not token:
+                # Already revoked: idempotent, and no second notification for one revocation.
                 return
             self = list(token)[0]
 
@@ -1372,6 +1424,7 @@ class AbstractRefreshToken(models.Model):
             self.access_token = None
             self.revoked = timezone.now()
             self.save()
+            _dispatch_refresh_token_revoked(self, using=access_token_database)
 
     def __str__(self):
         # Never render the token itself: __str__ appears in the admin change

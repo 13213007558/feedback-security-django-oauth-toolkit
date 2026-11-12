@@ -372,11 +372,113 @@ and point the settings at them::
 
 Then run ``makemigrations`` and ``migrate``. On a fresh database this works out of the box.
 
-.. note:: If your ``RefreshToken`` overrides ``revoke()``, override ``revoke_family()`` as well.
-    ``revoke()`` invalidates a single token; ``revoke_family()`` is the set-based sweep that
-    ``REFRESH_TOKEN_REUSE_PROTECTION`` runs over a whole token family, and it reproduces what
-    ``revoke()`` does in bulk rather than calling it per row. Anything extra your ``revoke()``
-    does needs to happen in ``revoke_family()`` too, or reuse detection will skip it.
+Reacting to revocation on a swapped model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A swapped refresh-token model often needs to react when a credential is invalidated - for
+example marking a device session logged out. There are two revocation paths and they do not
+share per-row hooks, so pick the extension point deliberately.
+
+``revoke()`` invalidates a single token and goes through the normal model ``save()``/
+``delete()`` machinery. ``revoke_family()`` is the set-based sweep that
+``REFRESH_TOKEN_REUSE_PROTECTION`` runs over a whole token family; it writes with
+``QuerySet.update()``/``.delete()`` to stay a constant number of queries and therefore
+**never calls your overridden ``revoke()``, ``save()`` or ``delete()`` and never emits the
+ORM ``post_save``/``post_delete`` signals**. Logic placed in those hooks runs for one path
+and is silently skipped on the other.
+
+The recommended contract is the
+:data:`~oauth2_provider.core.signals.refresh_token_revoked` signal, which both paths emit
+after the revocation transaction commits. Subscribe once and device-session logout (or any
+other side effect) fires regardless of which path invalidated the credential, while the
+family sweep keeps its constant-query writes. Add the field on your swapped model::
+
+    # my_oauth/models.py
+    from django.db import models
+    from django.utils.translation import gettext_lazy as _
+
+    from oauth2_provider.models import AbstractRefreshToken
+
+
+    class RefreshToken(AbstractRefreshToken):
+        device_session = models.ForeignKey(
+            "my_oauth.DeviceSession",
+            on_delete=models.SET_NULL,
+            null=True,
+            blank=True,
+            related_name="refresh_tokens",
+            verbose_name=_("device session"),
+        )
+
+    class DeviceSession(models.Model):
+        logged_out_at = models.DateTimeField(null=True, blank=True)
+
+and register the logout in an ``AppConfig`` so the receiver is loaded at startup::
+
+    # my_oauth/apps.py
+    from django.apps import AppConfig
+
+    from oauth2_provider.core.signals import refresh_token_revoked
+
+
+    class MyOAuthConfig(AppConfig):
+        name = "my_oauth"
+
+        def ready(self):
+            from .models import DeviceSession
+
+            def mark_session_logged_out(sender, refresh_token, **kwargs):
+                if refresh_token.device_session_id is None:
+                    return
+                DeviceSession.objects.filter(pk=refresh_token.device_session_id).update(
+                    logged_out_at=refresh_token.revoked
+                )
+
+            refresh_token_revoked.connect(mark_session_logged_out)
+
+Because the new field lives on your own swapped model, the migration is a normal
+``makemigrations`` output in your app - no toolkit migration is involved::
+
+    # my_oauth/migrations/0002_refreshtoken_device_session.py
+    from django.db import migrations, models
+
+
+    class Migration(migrations.Migration):
+        dependencies = [
+            ("my_oauth", "0001_initial"),
+        ]
+
+        operations = [
+            migrations.CreateModel(
+                name="DeviceSession",
+                fields=[
+                    ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                    ("logged_out_at", models.DateTimeField(blank=True, null=True)),
+                ],
+            ),
+            migrations.AddField(
+                model_name="refreshtoken",
+                name="device_session",
+                field=models.ForeignKey(
+                    blank=True,
+                    null=True,
+                    on_delete=models.SET_NULL,
+                    related_name="refresh_tokens",
+                    to="my_oauth.devicesession",
+                ),
+            ),
+        ]
+
+The signal is dispatched through ``transaction.on_commit(..., robust=True)``: it fires only
+after the revocation commits (a rolled-back transaction never announces success), and a
+receiver that raises - say an unreachable push-notification service - is logged rather than
+undoing the revocation or suppressing the remaining commit callbacks. See
+:doc:`signals` for the full contract.
+
+If instead you override ``revoke()`` to change *how* the row is written, you must override
+``revoke_family()`` too and keep the same end state (live members stamped ``revoked`` with
+their access tokens deleted), or reuse detection will skip your behavior. Prefer the signal
+for side effects; reserve the method override for changing the write itself.
 
 .. note:: This is straightforward for a **new** project. Migrating an **existing** deployment that
     already has data in the default ``oauth2_provider`` tables is a data-migration exercise that is
