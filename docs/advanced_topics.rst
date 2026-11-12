@@ -26,6 +26,12 @@ logo, acceptance of some user agreement and so on.
     * :attr:`authorization_grant_type` Authorization flows available to the Application
     * :attr:`client_secret` Confidential secret issued to the client during the registration process as described in :rfc:`2.2`
     * :attr:`name` Friendly name for the Application
+    * :attr:`deactivated_at` When the client was deactivated; ``None`` means active. See
+      :ref:`client-deactivation`
+    * :attr:`deactivation_reason` Free-form reason recorded with the last deactivation
+    * :attr:`reactivated_at` When the client was last reactivated
+    * :attr:`authorization_generation` Monotonic generation stamped on issued credentials;
+      deactivation increments it so pre-boundary credentials stay dead
 
 Django OAuth Toolkit lets you extend the AbstractApplication model in a fashion like Django's
 custom user models.

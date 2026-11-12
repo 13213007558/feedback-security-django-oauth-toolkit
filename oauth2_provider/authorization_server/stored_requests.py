@@ -115,6 +115,13 @@ def consume_authorization_request(request_uri: str, client_id: Optional[str]) ->
             if not client_id or client_id != record.client_id:
                 # Leave the record intact so the legitimate client can still use it.
                 raise StoredAuthorizationRequestError("The request_uri was not issued to this client.")
+            if record.revoked_at is not None:
+                # A request withdrawn by client deactivation is refused, but its
+                # parameters must not be handed back, and the row stays for
+                # investigation rather than being consumed.
+                raise StoredAuthorizationRequestError(
+                    "The request_uri was withdrawn because the client was deactivated."
+                )
             parameters = record.parameters
             expired = record.is_expired()
             record.delete()

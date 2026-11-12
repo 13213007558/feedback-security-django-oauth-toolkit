@@ -64,7 +64,15 @@ class ApplicationAdmin(admin.ModelAdmin):
     # hash_client_secret-driven client_secret help text (and the shared
     # application_form.js that updates it live as the checkbox is toggled).
     form = ApplicationForm
-    list_display = ("pk", "name", "user", "client_type", "authorization_grant_type", "registration_source")
+    list_display = (
+        "pk",
+        "name",
+        "user",
+        "client_type",
+        "authorization_grant_type",
+        "registration_source",
+        "is_active",
+    )
     list_filter = (
         "client_type",
         "authorization_grant_type",
@@ -73,6 +81,7 @@ class ApplicationAdmin(admin.ModelAdmin):
         "token_endpoint_auth_method",
         "can_introspect",
     )
+    actions = ("deactivate_applications", "reactivate_applications")
     radio_fields = {
         "client_type": admin.HORIZONTAL,
         "authorization_grant_type": admin.VERTICAL,
@@ -85,7 +94,54 @@ class ApplicationAdmin(admin.ModelAdmin):
     # created and must not be editable in the admin, or a manually provisioned
     # application could be handed over to those code paths (e.g. by flipping it
     # to "dcr"). cimd_expires_at is maintained by the CIMD resolver.
-    readonly_fields = ("registration_source", "cimd_expires_at")
+    # ``authorization_generation`` is the deactivation fence: it must only move
+    # through the deactivate/reactivate actions (or the management helpers), never
+    # be hand-edited on the change form. The deactivation fields are read-only for
+    # the same reason -- clearing ``deactivated_at`` by hand would restore the
+    # client without moving the fence, reviving withdrawn credentials.
+    readonly_fields = (
+        "registration_source",
+        "cimd_expires_at",
+        "authorization_generation",
+        "reactivated_at",
+        # Deactivation must go through the action (or ``deactivate_application``)
+        # so the generation fence moves with it. Editing the timestamp by hand
+        # would leave credentials from before it usable after a reactivation.
+        "deactivated_at",
+        "deactivation_reason",
+    )
+
+    @admin.display(boolean=True, description="active")
+    def is_active(self, obj):
+        return obj is None or obj.deactivated_at is None
+
+    @admin.action(description="Deactivate selected clients (withdraw their credentials)")
+    def deactivate_applications(self, request, queryset):
+        """Deactivate each selected client, keeping every row for investigation."""
+        from oauth2_provider.authorization_server.deactivation import deactivate_application
+
+        deactivated = 0
+        for application in queryset:
+            summary = deactivate_application(application, reason="Administrator deactivation")
+            deactivated += int(summary.changed)
+        self.message_user(
+            request,
+            ngettext("Deactivated %d client.", "Deactivated %d clients.", deactivated) % deactivated,
+        )
+
+    @admin.action(description="Reactivate selected clients (without restoring withdrawn credentials)")
+    def reactivate_applications(self, request, queryset):
+        """Clear the deactivation flag; revoked authorizations stay revoked."""
+        from oauth2_provider.authorization_server.deactivation import reactivate_application
+
+        reactivated = 0
+        for application in queryset:
+            summary = reactivate_application(application)
+            reactivated += int(summary.changed)
+        self.message_user(
+            request,
+            ngettext("Reactivated %d client.", "Reactivated %d clients.", reactivated) % reactivated,
+        )
 
 
 class AccessTokenAdmin(admin.ModelAdmin):

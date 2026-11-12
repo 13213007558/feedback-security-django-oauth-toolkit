@@ -95,6 +95,23 @@ Upgrading to 3.0
   ensure your routers direct the token models to the correct database (see
   :ref:`the multiple-databases note <extend_token_models>`).
 
+Unreleased schema additions
+---------------------------
+
+The client-deactivation feature (:ref:`client-deactivation`) adds fields to every
+swappable model: ``deactivated_at``, ``deactivation_reason``, ``reactivated_at`` and
+``authorization_generation`` on the application; ``authorization_generation`` and
+``revoked_at`` on the grant, access token and ID token; ``authorization_generation``,
+``revocation_reason`` and ``revoked_at`` on the refresh token; ``authorization_generation``
+on the device grant; and ``revoked_at`` on the stored authorization request. Run
+``migrate``, and if you have swapped any of these models, run ``makemigrations`` for your
+app first.
+
+The generation columns default to ``0``, so rows written before the upgrade keep working
+while the client has never been deactivated. The first deactivation moves the client to
+generation ``1``; from then on, a legacy row without a recorded generation fails closed
+rather than being treated as current.
+
 Upgrading to 3.4.1
 ------------------
 

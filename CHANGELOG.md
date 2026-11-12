@@ -15,6 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 ### Added
+* Reversible client deactivation (security). `Application.deactivate()` (and the
+  `ApplicationAdmin` "Deactivate selected clients" action) marks a client inactive and
+  bumps its `authorization_generation` in one transaction, withdrawing every outstanding
+  authorization code, stored/pushed authorization request, device grant, refresh token,
+  access token and ID token. `Application.reactivate()` clears only the flag: the
+  generation is never lowered and nothing withdrawn is restored, so a reactivation cannot
+  revive authorizations from the deactivation window. The same boundary is enforced on
+  every issuance path (authorization, code exchange, refresh, password and client-credentials
+  grants, device authorization and exchange), on bearer-token validation and introspection,
+  and on RFC 7592 management. Withdrawal tombstones the rows (`revoked_at` /
+  `revocation_reason`, device grants marked denied) instead of deleting them, so the
+  incident can still be investigated; `cleartokens` reclaims them by expiry as usual.
+  New fields on every swappable model — run `migrate`, and `makemigrations` for swapped
+  models. See the "Client deactivation" section of `docs/security.rst` for the
+  single-database transaction scope and why a SQLite test does not prove multi-process
+  lock behavior.
 * #1946 Support for Django 6.1. The PostgreSQL, MySQL and Oracle CI checks move from Django 6.0
   to 6.1, so they now cover Django 5.2 and 6.1.
 * #1902 ID Tokens can carry the `acr` claim (OpenID Connect Core 1.0 §2), reported by the new

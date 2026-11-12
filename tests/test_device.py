@@ -1049,6 +1049,11 @@ class TestDeviceFlow(DeviceFlowBaseTestCase):
         self.oauth2_settings.OAUTH_DEVICE_USER_CODE_GENERATOR = lambda: "XYZ"
 
         long_scope = " ".join(f"scope{i}" for i in range(300))
+        # The scopes the device asks for must be registered as available, or the
+        # request is correctly rejected as an invalid scope; this test is about
+        # storage, not about scope admission.
+        self.oauth2_settings.SCOPES = {name: name for name in long_scope.split()}
+        self.oauth2_settings._SCOPES = list(self.oauth2_settings.SCOPES)
         assert len(long_scope) > 2048
 
         device_authorization_response = self.client.post(

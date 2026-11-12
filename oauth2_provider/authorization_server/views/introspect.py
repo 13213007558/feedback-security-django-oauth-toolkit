@@ -208,6 +208,15 @@ class IntrospectTokenView(FormEncodedRequestMixin, ClientProtectedScopedResource
         except ObjectDoesNotExist:
             return JsonResponse({"active": False}, status=200)
         else:
+            application = token.application
+            if application is not None and (
+                application.is_deactivated()
+                or not application.has_current_authorization(token.authorization_generation)
+            ):
+                # RFC 7662 section 2.2: an inactive token must be reported inactive.
+                # A deactivated client's tokens are inactive even while their rows
+                # still exist (deactivation tombstones them instead of deleting them).
+                return JsonResponse({"active": False}, status=200)
             if token.is_valid():
                 data = {
                     "active": True,

@@ -3,6 +3,7 @@ import json
 from django import forms, http
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import ValidationError
+from django.db import connection, router, transaction
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils.decorators import method_decorator
@@ -39,11 +40,17 @@ class DeviceAuthorizationView(FormEncodedRequestMixin, AuthorizationServerViewMi
             return http.JsonResponse(data=json.loads(response), status=status, headers=headers)
 
         client_id = request.POST["client_id"]
+        Application = get_application_model()
+        application_generation = 0
         requested_scope = request.POST.get("scope", "").strip()
-        if requested_scope:
-            scope = requested_scope
-        else:
-            Application = get_application_model()
+        # oauthlib resolves the scopes (falling back to the client's defaults) and
+        # returns them in ``response["scope"]``. They belong on the stored grant,
+        # not in the RFC 8628 response, which defines no scope member.
+        resolved_scope = response.pop("scope", "")
+        # The row lock serializes this with ``deactivate_application`` and lets the
+        # grant record the generation current at initiation, not at exchange time.
+        using = router.db_for_write(Application)
+        with transaction.atomic(using=using):
             try:
                 application = Application.objects.get(client_id=client_id)
             except Application.DoesNotExist:
@@ -52,19 +59,44 @@ class DeviceAuthorizationView(FormEncodedRequestMixin, AuthorizationServerViewMi
                     status=401,
                     headers=headers,
                 )
-            core = self.get_oauthlib_core()
-            uri = request.build_absolute_uri()
-            http_method = request.method
-            body = urlencode(core.extract_body(request))
-            req_headers = core.extract_headers(request)
-            oauthlib_request = OAuthlibRequest(uri, http_method=http_method, body=body, headers=req_headers)
-            oauthlib_request.client_id = client_id
-            oauthlib_request.client = application
-            validator = core.server.request_validator
-            scope = " ".join(validator.get_default_scopes(client_id, oauthlib_request))
-        device_request = DeviceRequest(client_id=client_id, scope=scope)
-        device_response = DeviceCodeResponse(**response)
-        create_device_grant(device_request, device_response)
+            # Re-read the row under the lock: a deactivation committed between the
+            # lookup above and this point must be seen before a grant is written.
+            # The lock is optional on backends that ignore it (e.g. SQLite), and a
+            # custom model manager may not support it at all.
+            if getattr(connection.features, "has_select_for_update", False):
+                application = Application.objects.select_for_update().get(pk=application.pk)
+            if application.is_deactivated():
+                return http.JsonResponse(
+                    {"error": "invalid_client", "error_description": "The client is deactivated."},
+                    status=401,
+                    headers=headers,
+                )
+            application_generation = int(application.authorization_generation or 0)
+            if requested_scope:
+                scope = requested_scope
+            else:
+                core = self.get_oauthlib_core()
+                uri = request.build_absolute_uri()
+                http_method = request.method
+                body = urlencode(core.extract_body(request))
+                req_headers = core.extract_headers(request)
+                oauthlib_request = OAuthlibRequest(
+                    uri, http_method=http_method, body=body, headers=req_headers
+                )
+                oauthlib_request.client_id = client_id
+                oauthlib_request.client = application
+                validator = core.server.request_validator
+                scope = " ".join(validator.get_default_scopes(client_id, oauthlib_request))
+            if not scope:
+                scope = resolved_scope
+            device_request = DeviceRequest(client_id=client_id, scope=scope)
+            device_response = DeviceCodeResponse(**response)
+            # The grant is written under the same lock, stamped with the generation
+            # read above. An approval or exchange after a deactivation is refused by
+            # the generation fence even if the withdrawal sweep raced the insert.
+            create_device_grant(
+                device_request, device_response, authorization_generation=application_generation
+            )
 
         return http.JsonResponse(data=response, status=status, headers=headers)
 

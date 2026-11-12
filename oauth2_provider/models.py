@@ -461,6 +461,44 @@ class AbstractApplication(models.Model):
         ),
         verbose_name=_("can introspect tokens"),
     )
+    # Reversible client deactivation. ``deactivated_at`` is the boundary: while it is
+    # set the client cannot start or finish an authorization request, redeem a code,
+    # refresh a token, authenticate to the token endpoint or use its access tokens.
+    # ``authorization_generation`` is the data-level fence: every credential minted for
+    # the client carries the generation current when it was issued, and deactivation
+    # bumps it. Restoring the client clears ``deactivated_at`` but never lowers the
+    # generation or un-revokes a credential, so authorizations withdrawn while the
+    # client was deactivated stay withdrawn.
+    deactivated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_("When this client was deactivated; null means active."),
+        verbose_name=_("deactivated at"),
+    )
+    deactivation_reason = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text=_("Free-form reason recorded for the last deactivation, for operators."),
+        verbose_name=_("deactivation reason"),
+    )
+    reactivated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_("When this client was last reactivated."),
+        verbose_name=_("reactivated at"),
+    )
+    authorization_generation = models.PositiveIntegerField(
+        default=0,
+        editable=False,
+        help_text=_(
+            "Monotonic generation of issued credentials. Incremented on deactivation so "
+            "credentials issued before the boundary can never be used after it."
+        ),
+        verbose_name=_("authorization generation"),
+    )
 
     class Meta:
         abstract = True
@@ -902,13 +940,102 @@ class AbstractApplication(models.Model):
     def allows_grant_type(self, *grant_types):
         return self.authorization_grant_type in grant_types
 
+    def is_deactivated(self) -> bool:
+        """Whether the client is currently deactivated.
+
+        This is what every enforcement path checks. It is a method, not a property,
+        so a swapped application model that happens to define a field named
+        ``is_active`` cannot shadow it and silently bypass the boundary: a field
+        with this name would make the call fail loudly instead of returning a
+        truthy default.
+
+        Deactivation is reversible; see :meth:`reactivate`.
+        """
+        return self.deactivated_at is not None
+
+    @property
+    def is_active(self) -> bool:
+        """Convenience inverse of :meth:`is_deactivated`, for templates and the admin."""
+        return not self.is_deactivated()
+
     def is_usable(self, request):
         """
         Determines whether the application can be used.
 
+        The built-in policy rejects a deactivated client before consulting an
+        override, so a swapped model cannot re-enable one by accident. Subclasses
+        should extend this method rather than replacing it, for the same reason.
+
         :param request: The oauthlib.common.Request being processed.
         """
+        if self.is_deactivated():
+            return False
         return True
+
+    def deactivate(self, *, reason: str = "") -> bool:
+        """Deactivate this client and fence off everything issued before now.
+
+        Bumping :attr:`authorization_generation` is what makes the boundary
+        effective for credentials that are not enumerated here (an authorization
+        code already sitting in a browser redirect, a refresh token held by the
+        client, a bearer token cached by a resource server). The caller is
+        responsible for withdrawing the rows it can see, atomically with this call
+        -- :func:`deactivate_application` does that.
+
+        Returns ``True`` when this call changed the state, ``False`` when the
+        client was already deactivated (in which case the generation is not
+        bumped again, so a repeated disable is idempotent).
+        """
+        if self.is_deactivated():
+            return False
+        now = timezone.now()
+        self.deactivated_at = now
+        self.deactivation_reason = reason[:255]
+        self.authorization_generation += 1
+        self.save(
+            update_fields=[
+                "deactivated_at",
+                "deactivation_reason",
+                "authorization_generation",
+                "updated",
+            ]
+        )
+        return True
+
+    def reactivate(self) -> bool:
+        """Clear the deactivation boundary without restoring withdrawn credentials.
+
+        This only clears :attr:`deactivated_at` and records
+        :attr:`reactivated_at`. The generation stays where deactivation put it and
+        every token or code withdrawn then stays revoked, so restoring the client
+        grants no permission it did not have before it was deactivated: new
+        authorizations start from the new generation, old ones remain dead.
+
+        Returns ``True`` when this call changed the state, ``False`` when the
+        client was already active.
+        """
+        if not self.is_deactivated():
+            return False
+        self.deactivated_at = None
+        self.reactivated_at = timezone.now()
+        self.save(update_fields=["deactivated_at", "reactivated_at", "updated"])
+        return True
+
+    def has_current_authorization(self, generation: int | None) -> bool:
+        """Whether ``generation`` belongs to the client's live authorization epoch.
+
+        Credentials minted before the last deactivation carry a smaller generation
+        and are refused even after the client is reactivated. ``None`` is accepted
+        only for rows written before the fence existed, and only while the client
+        has never been deactivated (generation 0); after any deactivation such a
+        legacy row fails closed.
+        """
+        if generation is None:
+            # Only rows written before the fence existed carry no generation, and
+            # those are accepted only while the client has never been deactivated.
+            # After any deactivation they fail closed.
+            return self.authorization_generation == 0
+        return generation == self.authorization_generation
 
     @staticmethod
     def _client_secret_is_hashed(client_secret):
@@ -1055,6 +1182,23 @@ class AbstractGrant(models.Model):
     claims = models.TextField(blank=True, verbose_name=_("claims"))
 
     resource = ResourceJSONField(blank=True, default=list, verbose_name=_("resource"))
+    # The client generation at authorization time (see
+    # ``AbstractApplication.authorization_generation``). A code minted before a
+    # deactivation carries the older value and cannot be redeemed after it.
+    authorization_generation = models.PositiveIntegerField(
+        default=0,
+        editable=False,
+        verbose_name=_("authorization generation"),
+    )
+    # Set when the code is withdrawn because the client was deactivated. The row
+    # is kept for investigation; ``validate_code`` refuses a withdrawn grant the
+    # same way it refuses an expired one.
+    revoked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("revoked at"),
+    )
 
     def is_expired(self):
         """
@@ -1064,6 +1208,10 @@ class AbstractGrant(models.Model):
             return True
 
         return timezone.now() >= self.expires
+
+    def is_revoked(self) -> bool:
+        """Whether the grant was withdrawn before it was redeemed."""
+        return self.revoked_at is not None
 
     def redirect_uri_allowed(self, uri: str) -> bool:
         allowed = uri == self.redirect_uri
@@ -1108,6 +1256,10 @@ class AbstractAccessToken(models.Model):
     * :attr:`scope` Allowed scopes
     * :attr:`resource` RFC 8707 resource indicator(s) - JSON-encoded array of URIs
     * :attr:`claims` The OIDC ``claims`` request (Core 5.5) the token was issued for
+    * :attr:`authorization_generation` The client generation the token was minted
+      under; older generations are refused after a client deactivation
+    * :attr:`revoked_at` When the token was withdrawn (client deactivation); the
+      row is kept for investigation
     """
 
     id = models.BigAutoField(primary_key=True)
@@ -1162,6 +1314,28 @@ class AbstractAccessToken(models.Model):
 
     created = models.DateTimeField(auto_now_add=True, verbose_name=_("created"))
     updated = models.DateTimeField(auto_now=True, verbose_name=_("updated"))
+    # The client generation the token was minted under. A token minted before a
+    # deactivation never becomes usable again after a reactivation, even though
+    # the application row's own deactivation timestamp is cleared.
+    authorization_generation = models.PositiveIntegerField(
+        default=0,
+        editable=False,
+        verbose_name=_("authorization generation"),
+    )
+    # Deactivation keeps the row for investigation and marks it invalid instead of
+    # deleting it. A deliberate revoke still deletes the row (see ``revoke()``).
+    revoked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("revoked at"),
+    )
+    revocation_reason = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name=_("revocation reason"),
+    )
 
     def is_valid(self, scopes=None):
         """
@@ -1169,7 +1343,7 @@ class AbstractAccessToken(models.Model):
 
         :param scopes: An iterable containing the scopes to check or None
         """
-        return not self.is_expired() and self.allow_scopes(scopes)
+        return not self.is_expired() and not self.is_revoked() and self.allow_scopes(scopes)
 
     def is_expired(self):
         """
@@ -1179,6 +1353,10 @@ class AbstractAccessToken(models.Model):
             return True
 
         return timezone.now() >= self.expires
+
+    def is_revoked(self) -> bool:
+        """Whether the token was withdrawn (e.g. by client deactivation)."""
+        return self.revoked_at is not None
 
     def allows_audience(self, audience_uri):
         """
@@ -1265,6 +1443,8 @@ class AbstractRefreshToken(models.Model):
                            bounded to
     * :attr:`revoked` Timestamp of when this refresh token was revoked
     * :attr:`resource` RFC 8707 resource indicator(s), JSON-encoded array of URIs
+    * :attr:`authorization_generation` The client generation the token was minted
+      under; a token from an older generation is refused after a deactivation
     """
 
     id = models.BigAutoField(primary_key=True)
@@ -1306,6 +1486,24 @@ class AbstractRefreshToken(models.Model):
     created = models.DateTimeField(auto_now_add=True, verbose_name=_("created"))
     updated = models.DateTimeField(auto_now=True, verbose_name=_("updated"))
     revoked = models.DateTimeField(null=True, verbose_name=_("revoked"))
+    # Kept for investigation when the client was deactivated: unlike a deliberate
+    # revoke, deactivation does not delete the access token row, it tombstones it.
+    revocation_reason = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name=_("revocation reason"),
+    )
+    # The client generation at issue time, so a refresh token minted before a
+    # deactivation is not honored after a reactivation. Null is a legacy row,
+    # accepted only while the client has never been deactivated.
+    authorization_generation = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        default=None,
+        editable=False,
+        verbose_name=_("authorization generation"),
+    )
 
     @classmethod
     def revoke_family(cls, token_family: uuid.UUID | None) -> None:
@@ -1431,6 +1629,27 @@ class AbstractIDToken(models.Model):
 
     created = models.DateTimeField(auto_now_add=True, verbose_name=_("created"))
     updated = models.DateTimeField(auto_now=True, verbose_name=_("updated"))
+    authorization_generation = models.PositiveIntegerField(
+        default=0,
+        editable=False,
+        verbose_name=_("authorization generation"),
+    )
+    revoked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("revoked at"),
+    )
+    revocation_reason = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name=_("revocation reason"),
+    )
+
+    def is_revoked(self) -> bool:
+        """Whether the token was withdrawn by client deactivation."""
+        return self.revoked_at is not None
 
     def is_valid(self, scopes=None):
         """
@@ -1438,7 +1657,7 @@ class AbstractIDToken(models.Model):
 
         :param scopes: An iterable containing the scopes to check or None
         """
-        return not self.is_expired() and self.allow_scopes(scopes)
+        return not self.is_expired() and not self.is_revoked() and self.allow_scopes(scopes)
 
     def is_expired(self):
         """
@@ -1538,6 +1757,13 @@ class AbstractDeviceGrant(models.Model):
     )
     client_id = models.CharField(max_length=100, db_index=True, verbose_name=_("client ID"))
     last_checked = models.DateTimeField(auto_now=True, verbose_name=_("last checked"))
+    # The client generation at initiation. A device authorization started before
+    # the client was deactivated cannot be approved or exchanged afterwards.
+    authorization_generation = models.PositiveIntegerField(
+        default=0,
+        editable=False,
+        verbose_name=_("authorization generation"),
+    )
 
     def is_expired(self):
         """
@@ -1580,7 +1806,10 @@ class DeviceCodeResponse:
 
 
 def create_device_grant(
-    device_request: DeviceRequest, device_response: DeviceCodeResponse
+    device_request: DeviceRequest,
+    device_response: DeviceCodeResponse,
+    *,
+    authorization_generation: int = 0,
 ) -> AbstractDeviceGrant:
     now = datetime.now(tz=dt_timezone.utc)
 
@@ -1590,6 +1819,7 @@ def create_device_grant(
         user_code=device_response.user_code,
         scope=device_request.scope or "",
         expires=now + timedelta(seconds=device_response.expires_in),
+        authorization_generation=authorization_generation,
     )
 
 
@@ -1634,6 +1864,14 @@ class AbstractStoredAuthorizationRequest(models.Model):
     parameters = models.JSONField(default=dict, verbose_name=_("parameters"))
     expires = models.DateTimeField(verbose_name=_("expires"))
     created = models.DateTimeField(auto_now_add=True, verbose_name=_("created"))
+    # Set when client deactivation made the stored request unusable. The row is
+    # kept for investigation; ``consume_authorization_request`` refuses it.
+    revoked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("revoked at"),
+    )
 
     def is_expired(self) -> bool:
         """Whether the request URI has passed its ``expires`` deadline."""

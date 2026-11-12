@@ -27,6 +27,7 @@ from oauthlib.oauth2.rfc6749 import errors, utils
 from oauthlib.openid import RequestValidator
 
 from .authorization_server import cimd, client_assertions
+from .authorization_server.deactivation import DEACTIVATION_REASON, lock_application_for_issuance
 from .authorization_server.oidc.claims import (
     claim_value_matches,
     normalize_claims_request,
@@ -46,6 +47,7 @@ from .models import (
     AbstractRefreshToken,
     get_access_token_model,
     get_application_model,
+    get_device_grant_model,
     get_grant_model,
     get_id_token_model,
     get_refresh_token_model,
@@ -505,7 +507,16 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
     def validate_code(self, client_id, code, client, request, *args, **kwargs):
         try:
             grant = Grant.objects.get(code=code, application=client)
-            if not grant.is_expired():
+            # A grant withdrawn by client deactivation stays in the database for
+            # investigation but is as unusable as an expired one. The generation
+            # check is the second half of the same boundary: a code issued before
+            # a deactivation is refused even after the client is reactivated.
+            if (
+                not grant.is_expired()
+                and not grant.is_revoked()
+                and client.is_usable(request)
+                and client.has_current_authorization(grant.authorization_generation)
+            ):
                 request.scopes = grant.scope.split(" ")
                 request.user = grant.user
                 if grant.nonce:
@@ -520,6 +531,50 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
 
         except Grant.DoesNotExist:
             return False
+
+    def validate_device_code(self, client_id, code, request, *args, **kwargs):
+        """Validate a device_code and report its RFC 8628 section 3.5 status.
+
+        oauthlib's device code grant calls this on every token poll. Besides the
+        stored status, the client deactivation boundary applies: a device grant
+        denied by deactivation, or one started before the client's current
+        authorization generation, is refused like an unknown code (an
+        ``invalid_grant``), so a reactivation cannot resurrect it.
+
+        Returns one of the RFC 8628 section 3.5 status strings oauthlib's device
+        code grant dispatches on (the same values as its ``DEVICE_CODE_*``
+        constants), or ``None`` when the code is unknown or bound to another client.
+        """
+        device_model = get_device_grant_model()
+        try:
+            device = device_model.objects.get(device_code=code)
+        except device_model.DoesNotExist:
+            return None
+        if device.client_id != client_id:
+            return None
+
+        client = request.client
+        if (
+            client is None
+            or client.is_deactivated()
+            or not client.has_current_authorization(device.authorization_generation)
+        ):
+            return None
+
+        if device.is_expired():
+            return "expired_token"
+
+        if device.status == device_model.AUTHORIZED:
+            request.user = device.user
+            request.scopes = device.scope.split() if device.scope else []
+            return "authorized"
+        if device.status == device_model.DENIED:
+            return "access_denied"
+        if device.status == device_model.AUTHORIZATION_PENDING:
+            return "authorization_pending"
+        if device.status == device_model.EXPIRED:
+            return "expired_token"
+        return None
 
     def validate_grant_type(self, client_id, grant_type, client, request, *args, **kwargs):
         """
@@ -599,7 +654,14 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
     def validate_scopes(self, client_id, scopes, client, request, *args, **kwargs):
         """
         Ensure required scopes are permitted (as specified in the settings file)
+
+        An explicitly empty scope list (e.g. a whitespace-only ``scope`` parameter
+        on the device authorization endpoint) means "no scopes requested", so the
+        client's defaults apply. Otherwise RFC 8628's whitespace-only scope would
+        be validated as a scope literally named "", which no deployment registers.
         """
+        if list(scopes) == [""]:
+            scopes = list(self.get_default_scopes(client_id, request))
         available_scopes = get_scopes_backend().get_available_scopes(application=client, request=request)
         return set(scopes).issubset(set(available_scopes))
 
@@ -630,7 +692,26 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         return grant.code_challenge_method or None
 
     def save_authorization_code(self, client_id, code, request, *args, **kwargs):
-        self._create_authorization_code(request, code)
+        # The authorization response may have been built from a client object read
+        # before a concurrent deactivation committed. Re-read the application under
+        # a row lock and re-check the boundary in the same transaction that writes
+        # the code, so a deactivation that started after the consent form was
+        # rendered cannot produce a usable code.
+        grant_model = get_grant_model()
+        app_model = get_application_model()
+        grant_using = router.db_for_write(grant_model)
+        app_using = router.db_for_write(app_model)
+        lock_using = grant_using if grant_using == app_using else app_using
+        with transaction.atomic(using=grant_using):
+            try:
+                application = lock_application_for_issuance(client_id, using=lock_using)
+            except (app_model.DoesNotExist, ValueError):
+                raise errors.InvalidClientError(
+                    description="The client is not available.",
+                    request=request,
+                )
+            request.client = application
+            self._create_authorization_code(request, code)
 
     def get_authorization_code_scopes(self, client_id, code, redirect_uri, request):
         scopes = Grant.objects.filter(code=code).values_list("scope", flat=True).first()
@@ -652,9 +733,67 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
         for the storing of these token. This allows the transaction logic to be
         separate from the token handling.
         """
+        # Preserve the existing validation order: a malformed token dict fails
+        # before the database is touched.
+        if "scope" not in token:
+            raise FatalClientError("Failed to renew access token: missing scope")
+
         # Use the AccessToken's database instead of making the assumption it is in 'default'.
-        with transaction.atomic(using=router.db_for_write(AccessToken)):
+        token_using = router.db_for_write(AccessToken)
+        with transaction.atomic(using=token_using):
+            # Re-check the deactivation boundary under the application row lock
+            # before any token row is written. The client may have been deactivated
+            # after the grant or refresh token was validated, or after the code was
+            # redeemed in an earlier part of this request. When the application and
+            # the token live on the same database, the lock is held by this
+            # transaction through the writes below; otherwise it is taken on the
+            # application's database, and the generation fence still closes the gap.
+            app_using = router.db_for_write(get_application_model())
+            application = self._lock_current_client(
+                request, using=token_using if token_using == app_using else app_using
+            )
+            expected = self._expected_authorization_generation(request)
+            if expected is not None and not application.has_current_authorization(expected):
+                raise errors.InvalidGrantError(
+                    description="The authorization predates the client's current state.",
+                    request=request,
+                )
+            request.client = application
             return self._save_bearer_token(token, request, *args, **kwargs)
+
+    def _lock_current_client(self, request, *, using: str | None = None) -> AbstractApplication:
+        """Lock and re-read the request's client, refusing a deactivated one.
+
+        Raises ``InvalidClientError`` for an unknown/deactivated client, which is
+        the OAuth error that belongs to "the client cannot act".
+        """
+        client_id = getattr(request, "client_id", None) or getattr(request.client, "client_id", None)
+        if client_id is None:
+            raise errors.InvalidClientError(description="The client is not available.", request=request)
+        try:
+            return lock_application_for_issuance(client_id, using=using)
+        except Application.DoesNotExist:
+            raise errors.InvalidClientError(description="The client is not available.", request=request)
+        except ValueError:
+            raise errors.InvalidClientError(description="The client is not available.", request=request)
+
+    def _expected_authorization_generation(self, request) -> int | None:
+        """The generation a credential presented by the request was minted under.
+
+        An authorization-code exchange is fenced by the code's generation; a
+        refresh by the refresh token's. Other grants mint a fresh authorization
+        from the client's current generation, so they have no older credential to
+        honor.
+        """
+        if getattr(request, "grant_type", None) == "authorization_code":
+            grant = Grant.objects.filter(
+                code=getattr(request, "code", None), application=request.client
+            ).first()
+            return None if grant is None else grant.authorization_generation
+        if getattr(request, "grant_type", None) == "refresh_token":
+            instance = getattr(request, "refresh_token_instance", None)
+            return getattr(instance, "authorization_generation", None)
+        return None
 
     def _validate_resource_uris(self, request, resources):
         """
@@ -912,6 +1051,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             source_refresh_token=source_refresh_token,
             resource=getattr(request, "resource", []),  # RFC 8707
             claims=self._claims_request_to_store(request),  # OIDC Core 5.5
+            authorization_generation=request.client.authorization_generation,
         )
         self._set_token_value(access_token, token["access_token"])
         access_token.save()
@@ -949,6 +1089,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             application=request.client,
             user=request.user,
             code=code["code"],
+            authorization_generation=request.client.authorization_generation,
             expires=expires,
             redirect_uri=request.redirect_uri,
             scope=" ".join(request.scopes),
@@ -971,6 +1112,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             access_token=access_token,
             token_family=token_family,
             resource=getattr(request, "resource", []),  # RFC 8707
+            authorization_generation=request.client.authorization_generation,
         )
         self._set_token_value(refresh_token, refresh_token_code)
         try:
@@ -1112,6 +1254,10 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             return False
 
         if rt.revoked is not None:
+            if rt.revocation_reason == DEACTIVATION_REASON:
+                # Deactivation is a repudiation, never a rotation supersession, so
+                # the rotation grace window must not shield it.
+                return False
             grace_expired = rt.revoked <= timezone.now() - timedelta(
                 seconds=oauth2_settings.REFRESH_TOKEN_GRACE_PERIOD_SECONDS
             )
@@ -1166,6 +1312,13 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             source = rt.access_token or AccessToken.objects.filter(source_refresh_token=rt).first()
             request.claims = source.claims if source is not None else {}
 
+        # The refresh token is bound to the authorization epoch it was minted in:
+        # a client reactivation must not revive a token withdrawn at the boundary.
+        if not client.is_usable(request) or not client.has_current_authorization(
+            getattr(rt, "authorization_generation", None)
+        ):
+            return False
+
         request.user = rt.user
         # Use the raw token presented in the request, not rt.token: under hashed-at-rest
         # storage (COMPLIANT_BCP_RFC9700_TOKEN_STORAGE=True) the stored
@@ -1185,6 +1338,7 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
             expires=expires,
             jti=jti,
             application=request.client,
+            authorization_generation=request.client.authorization_generation,
         )
         return id_token
 
@@ -1457,6 +1611,14 @@ class OAuth2Validator(ResourceServerValidatorMixin, RequestValidator):
 
         id_token = self._load_id_token(token)
         if not id_token:
+            return False
+
+        application = id_token.application
+        if application is not None and (
+            application.is_deactivated()
+            or id_token.is_revoked()
+            or not application.has_current_authorization(getattr(id_token, "authorization_generation", None))
+        ):
             return False
 
         if not id_token.allow_scopes(scopes):

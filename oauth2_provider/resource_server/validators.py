@@ -323,6 +323,19 @@ class ResourceServerValidatorMixin:
             return None
         return (client_id, assertion)
 
+    def _application_is_current(self, application, credential) -> bool:
+        """Whether *application* may still speak for *credential*.
+
+        A deactivated client's tokens are refused everywhere, and a credential
+        minted under an older client generation stays refused after a reactivation
+        (see :func:`oauth2_provider.authorization_server.deactivation`).
+        """
+        if application is None:
+            return True
+        if application.is_deactivated():
+            return False
+        return application.has_current_authorization(getattr(credential, "authorization_generation", None))
+
     def validate_bearer_token(self, token, scopes, request):
         """
         When users try to access resources, check that provided token is valid
@@ -379,6 +392,19 @@ class ResourceServerValidatorMixin:
             # swapped Application model overrides it (e.g. to disable an app or
             # gate on request attributes). See #1260.
             application = access_token.application
+            if not self._application_is_current(application, access_token):
+                # A deactivated client's bearer tokens are dead at the resource
+                # server even if the local token row has not been swept yet.
+                request.oauth2_error = OrderedDict(
+                    [
+                        ("error", "invalid_token"),
+                        (
+                            "error_description",
+                            _("The access token is invalid."),
+                        ),
+                    ]
+                )
+                return False
             if application is not None and not application.is_usable(request):
                 request.oauth2_error = OrderedDict(
                     [

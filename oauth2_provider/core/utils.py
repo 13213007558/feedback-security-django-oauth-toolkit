@@ -163,5 +163,9 @@ def set_oauthlib_user_to_device_request_user(request: Request) -> None:
     device: AbstractDeviceGrant = get_device_grant_model().objects.get(
         device_code=request._params["device_code"]
     )
+    # ``OAuth2Validator.validate_device_code`` checked the status and the client
+    # deactivation boundary before this pre-token hook ran; it also populated any
+    # user and scopes. Reading them again here keeps this hook self-contained and
+    # works for validators that do not implement the hook.
     request.user = device.user
     request.scopes = device.scope.split() if device.scope else []

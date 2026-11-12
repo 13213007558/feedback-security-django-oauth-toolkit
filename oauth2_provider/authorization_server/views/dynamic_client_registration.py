@@ -832,6 +832,18 @@ class DynamicClientRegistrationManagementView(View):
                 status=401,
             )
 
+        application_for_token = token.application
+        if application_for_token is not None and (
+            application_for_token.is_deactivated()
+            or not application_for_token.has_current_authorization(token.authorization_generation)
+        ):
+            # A deactivated client cannot manage its own registration either:
+            # deactivation freezes the client, not only its user-facing tokens.
+            return _error_response(
+                "invalid_token",
+                "Registration access token is expired or invalid",
+                status=401,
+            )
         if not token.is_valid([oauth2_settings.DCR_REGISTRATION_SCOPE]):
             return _error_response(
                 "invalid_token",

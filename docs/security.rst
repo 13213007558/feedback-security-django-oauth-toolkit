@@ -168,6 +168,69 @@ otherwise derived from the request).
    metadata ``issuer``; the issuer suffix cannot be derived from the authorization
    request itself.
 
+.. _client-deactivation:
+
+Client deactivation
+--------------------
+
+Deactivating a client is the operator-side counterpart of :rfc:`6749#section-3.2.1`,
+which names "disabling the client or changing its credentials" as the way to recover
+from a compromised one. DOT makes this a reversible state, not a delete, so every row
+stays available to an investigation.
+
+``Application.deactivate(reason="")`` (or the admin action "Deactivate selected
+clients") sets ``deactivated_at`` and bumps the client's
+``authorization_generation``. While the timestamp is set, all of these refuse the
+client:
+
+* the authorization endpoint (a consent page opened earlier cannot produce a code);
+* the token endpoint, for codes, refreshes, password and client-credentials grants;
+* the device authorization endpoint and the device code exchange;
+* bearer-token validation and introspection of tokens already issued;
+* RFC 7592 dynamic-client-management requests for that client.
+
+Deactivation also withdraws the rows it can see — outstanding authorization codes,
+stored authorization requests (including pushed ones), device grants, refresh tokens,
+access tokens and ID tokens. Those rows are **kept** and tombstoned
+(``revoked_at``/``revocation_reason``; device grants are marked ``denied``), so an
+investigation can still see what was live at the boundary. ``cleartokens`` reclaims
+them later by expiry, as it does any other expired credential.
+
+``Application.is_deactivated()`` is the check every enforcement path makes; it is a
+method rather than a property so a swapped model cannot shadow it with a field.
+``Application.is_active`` is a convenience inverse for templates and the admin.
+
+Reactivating with ``Application.reactivate()`` (or the admin action) clears
+``deactivated_at`` only. The generation is never lowered and no tombstone is removed,
+so **a reactivation never restores an authorization withdrawn during the
+deactivation**: the old code, refresh token or access token stays dead, and the
+client has to obtain a fresh authorization.
+
+Credentials carry the generation they were minted under (on the grant, access token,
+refresh token, ID token and device grant). A credential from an older generation is
+refused even if the client is active again, which is what closes the window between
+the deactivation sweep and any row it could not see.
+
+Transaction scope and database locking
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``oauth2_provider.authorization_server.deactivation.deactivate_application()``
+changes the client and withdraws its visible credentials in a single transaction,
+taking the application row lock first. The issuance paths
+(``save_authorization_code`` and ``save_bearer_token`` in the validator, and the
+device authorization view) take the same row lock in the transaction that writes
+the credential. On a database that honors row locks (PostgreSQL, MySQL/InnoDB,
+Oracle) the two serialize: an issuance either commits before the deactivation and
+is swept by it, or starts after the deactivation and is refused.
+
+That guarantee is **single-database**. If a router puts the application and the
+credential models on different databases, one transaction cannot span them; the
+generation fence still refuses credentials from the old epoch, but the withdrawal is
+not one atomic unit. SQLite compiles ``SELECT ... FOR UPDATE`` away entirely
+(``connection.features.has_select_for_update`` is ``False``), so tests running on
+SQLite prove the check *ordering*, never multi-process lock behavior. Test that on a
+database you actually run in production.
+
 Refresh-token rotation and replay detection (§4.14)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Rotation is on by default (``ROTATE_REFRESH_TOKEN``). Set
